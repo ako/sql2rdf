@@ -18,6 +18,7 @@
 #include "sparql2sql/TermInference.h"
 #include "sparql2sql/TermInfo.h"
 #include "sparql2sql/TranslationError.h"
+#include "sparql2sql/TypeCatalog.h"
 #include "sparql2sql/ValuesFolder.h"
 #include "sparql2sql/ir/Optimizer.h"
 #include "sparql2sql/ir/RelNode.h"
@@ -526,6 +527,18 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 	TranslatedPattern result;
 	result.sql = sql;
 	result.providedTagVars = tagCols;
+	if (!nested && ctx.catalog() != nullptr) {
+		// A projected variable that is a bare copy of one base column can be
+		// returned in that column's declared type (typed results).
+		for (const auto &c : rootNode->schema()) {
+			if (c.prov == Provenance::PureColumn && !c.tableIdentity.empty()) {
+				const std::string type = ctx.catalog()->typeOf(c.tableIdentity, c.columnName);
+				if (!type.empty()) {
+					result.columnSqlTypes[c.var] = type;
+				}
+			}
+		}
+	}
 	if (selectStar) {
 		for (const auto &v : source.boundVars) {
 			if (!ctx.isInternal(v)) {
@@ -800,9 +813,94 @@ std::string translateConstruct(const sparql::ast::Query &query, TranslationConte
 
 } // namespace
 
+namespace {
+
+// The SQL type a typed result column gets for a variable whose term the
+// mapping settles, or "" to keep VARCHAR. `declared` is the catalog type of
+// the base column the variable copies, if any; it wins when it is a natural
+// match for the datatype (R2RML 10.2), so an INTEGER column stays INTEGER and
+// a DECIMAL(10,2) keeps its scale.
+std::string typedResultSqlType(const TermInfo &info, const std::string &declared) {
+	if (!isFullyDetermined(info) || info.kind != RdfTermKind::Literal || !info.lang.empty()) {
+		return std::string();
+	}
+	const std::string &dt = info.datatypeIri;
+	std::string fallback;
+	if (info.isIntegral()) {
+		fallback = "BIGINT";
+	} else if (dt == xsd::kDecimal) {
+		fallback = "DECIMAL(38,10)";
+	} else if (dt == xsd::kDouble || dt == xsd::kFloat) {
+		fallback = "DOUBLE";
+	} else if (dt == xsd::kBoolean) {
+		fallback = "BOOLEAN";
+	} else if (dt == xsd::kDate) {
+		fallback = "DATE";
+	} else if (dt == xsd::kDateTime) {
+		fallback = "TIMESTAMP";
+	} else {
+		return std::string(); // xsd:string and anything without a native SQL type
+	}
+	if (!declared.empty()) {
+		const std::string natural = naturalXsdDatatype(declared);
+		const TermInfo declaredInfo {RdfTermKind::Literal, natural, std::string(), false, false};
+		if (natural == dt || (info.isIntegral() && declaredInfo.isIntegral())) {
+			return declared;
+		}
+	}
+	return fallback;
+}
+
+// Typed results: cast each settled output column of a finished SELECT to its
+// native type. TRY_CAST, as everywhere else here, so a mis-declared datatype
+// yields NULL rather than failing the query.
+std::string typeSelectResult(const sparql::ast::Query &query, const TranslatedPattern &result, const std::string &sql,
+                             TranslationContext &ctx) {
+	const SqlDialect &dialect = ctx.dialect();
+	std::vector<std::string> outputVars;
+	if (query.selectStar) {
+		for (const auto &v : result.allVars()) {
+			outputVars.push_back(v);
+		}
+	} else {
+		for (const auto &item : query.selectItems) {
+			outputVars.push_back(item.var->name);
+		}
+	}
+	const std::string alias = ctx.nextAlias();
+	std::vector<std::pair<std::string, std::string>> replacements;
+	for (const auto &v : outputVars) {
+		// A computed SELECT item is not a bare copy of a column, whatever its name.
+		bool bare = query.selectStar;
+		for (const auto &item : query.selectItems) {
+			if (item.var->name == v && !item.expr) {
+				bare = true;
+			}
+		}
+		const auto declared = result.columnSqlTypes.find(v);
+		const std::string type = typedResultSqlType(
+		    result.termInfoOf(v), bare && declared != result.columnSqlTypes.end() ? declared->second : std::string());
+		if (type.empty()) {
+			continue;
+		}
+		const std::string col = mangleVar(v, dialect);
+		replacements.emplace_back(col, "TRY_CAST(" + alias + "." + col + " AS " + type + ")");
+	}
+	return dialect.replaceColumns(sql, alias, replacements);
+}
+
+} // namespace
+
 std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMapping &mapping,
                            const SqlDialect &dialect, const TypeCatalog *catalog, bool prettyPrint) {
-	TranslationContext ctx(mapping, dialect, catalog, prettyPrint);
+	TranslateOptions options;
+	options.prettyPrint = prettyPrint;
+	return translateQuery(query, mapping, dialect, catalog, options);
+}
+
+std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMapping &mapping,
+                           const SqlDialect &dialect, const TypeCatalog *catalog, const TranslateOptions &options) {
+	TranslationContext ctx(mapping, dialect, catalog, options.prettyPrint);
 
 	// FROM / FROM NAMED, fixed once for the whole translation: the grammar puts
 	// DatasetClause only on the top-level Query, so nested sub-selects and
@@ -877,6 +975,9 @@ std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMa
 	}
 
 	TranslatedPattern result = translateQueryPattern(query, ctx);
+	if (options.typedResults) {
+		return prependCtes(ctx, typeSelectResult(query, result, result.sql, ctx));
+	}
 	return prependCtes(ctx, result.sql);
 }
 

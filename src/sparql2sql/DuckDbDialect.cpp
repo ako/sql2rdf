@@ -152,4 +152,17 @@ std::string DuckDbDialect::combineByName(bool all, const std::vector<std::string
 	return out;
 }
 
+std::string DuckDbDialect::replaceColumns(const std::string &innerSql, const std::string &alias,
+                                          const std::vector<std::pair<std::string, std::string>> &replacements) const {
+	// DuckDB's `SELECT * REPLACE (...)` keeps every column and its position.
+	std::string list;
+	for (std::size_t i = 0; i < replacements.size(); ++i) {
+		list += (i > 0 ? ", " : "") + replacements[i].second + " AS " + replacements[i].first;
+	}
+	if (list.empty()) {
+		return innerSql;
+	}
+	return "SELECT * REPLACE (" + list + ") FROM (" + innerSql + ") AS " + alias;
+}
+
 } // namespace sparql2sql

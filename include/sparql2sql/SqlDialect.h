@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sparql2sql {
@@ -112,6 +113,13 @@ public:
 	/// the padding itself. `all=false` also deduplicates the combined
 	/// result (SQL UNION's usual behavior).
 	virtual std::string combineByName(bool all, const std::vector<std::string> &armSqls) const = 0;
+
+	/// `SELECT` every column of `innerSql` (aliased `alias`), in its order,
+	/// with the named ones replaced by the given expressions: the wrapper
+	/// typed results put around a finished SELECT. `replacements` maps an
+	/// already-quoted column name to its new expression.
+	virtual std::string replaceColumns(const std::string &innerSql, const std::string &alias,
+	                                   const std::vector<std::pair<std::string, std::string>> &replacements) const = 0;
 };
 
 } // namespace sparql2sql

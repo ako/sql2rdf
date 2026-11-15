@@ -561,11 +561,44 @@ std::string sparql2sql::translateQuery(const sparql::ast::Query& query,
                                         const sparql2sql::SqlDialect& dialect,
                                         const sparql2sql::TypeCatalog* catalog = nullptr);
 
+struct sparql2sql::TranslateOptions {
+    bool prettyPrint = false;   // lay the SQL out for reading
+    bool typedResults = false;  // SELECT columns as native SQL values (below)
+};
+std::string sparql2sql::translateQuery(const sparql::ast::Query& query,
+                                        const r2rml::R2RMLMapping& mapping,
+                                        const sparql2sql::SqlDialect& dialect,
+                                        const sparql2sql::TypeCatalog* catalog,
+                                        const sparql2sql::TranslateOptions& options);
+
 // Close a rendered relation over the WITH-clause entries its TranslationContext
 // accumulated: the hoisted rr:sqlQuery views, then any property-path closure CTEs.
 std::string sparql2sql::prependCtes(const sparql2sql::TranslationContext& ctx,
                                      const std::string& body);
 ```
+
+**Typed results.** By default every SELECT output column is the VARCHAR lexical form of its RDF term.
+With `TranslateOptions::typedResults`, each output column whose term the mapping settles as a literal
+of a datatype with a native SQL type is returned as that type instead. The finished SELECT is wrapped
+in `SqlDialect::replaceColumns` (`SELECT * REPLACE (...)` in DuckDB), so column names and order do not
+change. The mapping is:
+
+| Datatype | SQL type |
+|---|---|
+| `xsd:integer` and its narrower subtypes | `BIGINT` |
+| `xsd:decimal` | `DECIMAL(38,10)` |
+| `xsd:double`, `xsd:float` | `DOUBLE` |
+| `xsd:boolean` | `BOOLEAN` |
+| `xsd:date` | `DATE` |
+| `xsd:dateTime` | `TIMESTAMP` |
+
+When the column is a bare copy of a base column whose catalog type naturally maps to the same datatype
+(R2RML §10.2), that declared type is used instead: an `INTEGER` column stays `INTEGER`, and a
+`DECIMAL(10,2)` keeps its scale. Everything else stays VARCHAR: IRIs, blank nodes, `xsd:string`,
+language-tagged strings, other datatypes, and any column whose kind or datatype varies per row.
+Aggregates are typed by their result datatype, so `COUNT` and an integral `SUM` give `BIGINT`. The
+cast is a `TRY_CAST`, so a value that does not fit its declared datatype becomes NULL instead of
+failing the query. ASK and CONSTRUCT are not affected.
 
 `translateQuery()` applies `prependCtes()` to its own result, so ordinary callers never need it. It
 matters for the other direction: code driving `translateTriplePattern()`/`renderRelation()` itself

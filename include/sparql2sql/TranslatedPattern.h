@@ -67,6 +67,13 @@ struct TranslatedPattern {
 	/// RawRelation::providedTagVars for why those specifically.
 	std::set<std::string> providedTagVars;
 
+	/// The declared SQL type (from the TypeCatalog) of the base column a
+	/// projected variable is a bare copy of. Set by translateQueryPattern for
+	/// the top-level projection only, and only where both the catalog and the
+	/// column's provenance say so; typed results prefer it to the generic
+	/// type for the variable's datatype.
+	std::map<std::string, std::string> columnSqlTypes;
+
 	std::set<std::string> allVars() const {
 		std::set<std::string> out = boundVars;
 		out.insert(optionalVars.begin(), optionalVars.end());

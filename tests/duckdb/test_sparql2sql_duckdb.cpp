@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -2140,4 +2141,107 @@ TEST_CASE("construct_mixed_datatype.rq: each literal keeps its own row's datatyp
 	CHECK(countWhere(rows, "OBJECT_DATATYPE", "http://www.w3.org/2001/XMLSchema#integer") == 2);
 	CHECK(countWhere(rows, "OBJECT_DATATYPE", kXsdString) >= 1);
 	CHECK(countWhere(rows, "OBJECT_DATATYPE", kNull) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Typed results (TranslateOptions::typedResults): settled literal columns come
+// back as native SQL values, checked through DESCRIBE of the translated SQL.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string typedSql(const std::string &body, const R2RMLMapping &mapping, const sparql2sql::TypeCatalog *catalog,
+                     bool typed = true) {
+	Parser parser;
+	auto query = parser.parseString("PREFIX ex: <http://example.com/ns#>\n" + body);
+	DuckDbDialect dialect;
+	sparql2sql::TranslateOptions options;
+	options.typedResults = typed;
+	return translateQuery(*query, mapping, dialect, catalog, options);
+}
+
+// Column name (as DuckDB reports it) -> DuckDB type name.
+std::map<std::string, std::string> resultTypes(DuckDBConnection &conn, const std::string &sql) {
+	std::map<std::string, std::string> out;
+	for (const auto &r : collectRows(*conn.execute("DESCRIBE " + sql))) {
+		out[r.at("COLUMN_NAME")] = r.at("COLUMN_TYPE");
+	}
+	return out;
+}
+
+const char *const kTypedTermsQuery =
+    "SELECT ?m ?a ?p ?w ?t ?h WHERE { ?m ex:amount ?a ; ex:price ?p ; ex:when ?w ; ex:title ?t ; ex:homepage ?h }";
+
+} // namespace
+
+TEST_CASE("typed results: settled literals get native types, IRIs and strings stay VARCHAR") {
+	auto conn = makeSeededDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_terms.ttl");
+	const std::string sql = typedSql(kTypedTermsQuery, mapping, nullptr);
+	INFO("SQL: " << sql);
+	auto types = resultTypes(*conn, sql);
+	CHECK(types.at("v_m") == "VARCHAR");
+	CHECK(types.at("v_a") == "BIGINT");
+	CHECK(types.at("v_p") == "DECIMAL(38,10)");
+	CHECK(types.at("v_w") == "TIMESTAMP");
+	CHECK(types.at("v_t") == "VARCHAR"); // language-tagged
+	CHECK(types.at("v_h") == "VARCHAR"); // IRI
+	auto rows = collectRows(*conn->execute(sql));
+	REQUIRE(rows.size() == 2);
+	std::set<std::string> amounts;
+	for (const auto &r : rows) {
+		amounts.insert(r.at("V_A"));
+	}
+	CHECK(amounts == std::set<std::string> {"9", "100"});
+}
+
+TEST_CASE("typed results: a bare copy of a base column keeps its declared type") {
+	auto conn = makeSeededDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_terms.ttl");
+	sparql2sql::TypeCatalog cat;
+	sql2rdf::loadTypeCatalog(*conn, &mapping, cat);
+	auto types = resultTypes(*conn, typedSql(kTypedTermsQuery, mapping, &cat));
+	CHECK(types.at("v_a") == "INTEGER");
+	// PRICE is DOUBLE but declared xsd:decimal: the datatype decides.
+	CHECK(types.at("v_p") == "DECIMAL(38,10)");
+	CHECK(types.at("v_w") == "TIMESTAMP"); // a VARCHAR column declared xsd:dateTime
+	// A DECIMAL(10,2) column declared xsd:decimal keeps its scale.
+	R2RMLMapping decimals = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_decimal.ttl");
+	sparql2sql::TypeCatalog decCat;
+	sql2rdf::loadTypeCatalog(*conn, &decimals, decCat);
+	CHECK(resultTypes(*conn, typedSql("SELECT ?x WHERE { ?s ex:paid ?x }", decimals, &decCat)).at("v_x") ==
+	      "DECIMAL(10,2)");
+}
+
+TEST_CASE("typed results: aggregates, computed columns, and per-row datatypes") {
+	auto conn = makeSeededDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_terms.ttl");
+	const std::string agg =
+	    typedSql("SELECT (SUM(?a) AS ?s) (COUNT(?m) AS ?n) WHERE { ?m ex:amount ?a }", mapping, nullptr);
+	auto types = resultTypes(*conn, agg);
+	CHECK(types.at("v_s") == "BIGINT");
+	CHECK(types.at("v_n") == "BIGINT");
+	auto rows = collectRows(*conn->execute(agg));
+	REQUIRE(rows.size() == 1);
+	CHECK(rows[0].at("V_S") == "109");
+	CHECK(rows[0].at("V_N") == "2");
+	// ex:mixed is an IRI in one map and a literal in another: no single type.
+	CHECK(resultTypes(*conn, typedSql("SELECT ?x WHERE { ?m ex:mixed ?x }", mapping, nullptr)).at("v_x") == "VARCHAR");
+	// A mis-declared datatype (xsd:integer over text) gives NULL, not an error.
+	const std::string bad = typedSql("SELECT ?x WHERE { ?m ex:badtyped ?x }", mapping, nullptr);
+	for (const auto &r : collectRows(*conn->execute(bad))) {
+		CHECK(r.at("V_X") == kNull);
+	}
+}
+
+TEST_CASE("typed results: off by default, so every column stays VARCHAR") {
+	auto conn = makeSeededDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_terms.ttl");
+	for (const auto &t : resultTypes(*conn, typedSql(kTypedTermsQuery, mapping, nullptr, false))) {
+		CHECK(t.second == "VARCHAR");
+	}
 }
