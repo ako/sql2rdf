@@ -1118,8 +1118,14 @@ which no map in the mapping produces, so a pattern using it can never match
   - Arithmetic over two statically integral operands (`xsd:integer` and its narrower aliases) stays
     integral via `TRY_CAST(... AS BIGINT)`, so `?a + 1` renders `"10"` rather than `"10.0"`. The same
     applies to `SUM()`, and to `ABS()`/`CEIL()`/`FLOOR()`/`ROUND()`. Division, and any operand of
-    unknown or non-integral type, still goes through `DOUBLE`; integrality known only at run time is
-    not exploited, so such an expression renders as a double.
+    unknown or non-integral type, still goes through `DOUBLE`; for arithmetic, integrality known
+    only at run time is not exploited, so such an expression renders as a double.
+  - `SUM()` is the exception: when the mapping does not settle its argument's type (typically a
+    generic triple map — predicate from a column — that is a candidate beside a typed column), it
+    picks the result type per group from the rows' `d_<var>` tags. It is integral when every numeric
+    row is integral, fixed-point when the rows are integers and `xsd:decimal`s, and `DOUBLE` when any
+    row is `xsd:double`/`xsd:float` or an untyped literal that reads as a number. Rows that are not
+    numeric (IRIs, strings, untyped text such as `"n/a"`) are skipped and do not change the type.
   - `SUM()`, `MIN()` and `MAX()` over a statically `xsd:decimal` argument stay fixed-point: they
     aggregate `TRY_CAST(... AS DECIMAL(38,18))` and render the result in canonical decimal form
     (trailing fractional zeros and a trailing point removed), so `0.10 + 0.20` renders `"0.3"`

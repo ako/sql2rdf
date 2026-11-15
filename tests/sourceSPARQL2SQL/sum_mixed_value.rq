@@ -1,0 +1,2 @@
+PREFIX ex: <http://example.com/ns#>
+SELECT (SUM(?x) AS ?total) WHERE { ?s ex:value ?x }
