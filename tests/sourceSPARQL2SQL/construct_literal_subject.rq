@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.com/ns#>
+# A literal can never be a subject: that triple is dropped for every solution.
+CONSTRUCT { ?n ex:nameOf ?e . ?e ex:n ?n . }
+WHERE { ?e a ex:Employee ; ex:name ?n }

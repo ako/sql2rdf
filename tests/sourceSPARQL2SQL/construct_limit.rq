@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.com/ns#>
+# ORDER BY / LIMIT apply to the solutions, before the template.
+CONSTRUCT { ?e ex:n ?n . }
+WHERE { ?e a ex:Employee ; ex:name ?n }
+ORDER BY ?n LIMIT 1

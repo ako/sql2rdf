@@ -935,8 +935,27 @@ which no map in the mapping produces, so a pattern using it can never match
 
 ### Supported SPARQL subset / Known limitations
 
-- **Query forms**: only `SELECT` and `ASK`. `CONSTRUCT`/`DESCRIBE` throw `TranslationError`
-  (they produce an RDF graph, not a row set — a different translation shape, not yet implemented).
+- **Query forms**: `SELECT`, `ASK` and `CONSTRUCT` (including the short form `CONSTRUCT WHERE`).
+  `DESCRIBE` throws `TranslationError`.
+- **CONSTRUCT** returns one row per triple, in `read_rdf`'s columns: `subject`, `predicate`, `object`,
+  `object_datatype`, `object_lang`, all VARCHAR. The WHERE clause is translated as `SELECT *`, with its
+  solution modifiers (`ORDER BY`, `LIMIT` and `OFFSET` limit the solutions, not the triples). Every
+  template triple is then instantiated from one scan of the solutions, which are paired with a
+  `VALUES` list of template-triple numbers. The result is `DISTINCT`, because an RDF graph is a set.
+  - Encoding: an IRI is its text with `object_datatype` and `object_lang` NULL. A blank node is
+    `_:label`. A literal always has a datatype: its declared one, `rdf:langString` with a language
+    tag, or `xsd:string` when the mapping leaves the datatype open (a plain literal, as in RDF 1.1).
+  - A template blank node is fresh per solution: `_:<label>_<n>`, with `n` the solution's row
+    number (`ROW_NUMBER() OVER ()`), and shared by every template triple of that solution.
+  - Per SPARQL 1.1 §16.2, a template triple is skipped for a solution when one of its variables is
+    unbound, when its subject would be a literal, or when its predicate would not be an IRI. Where
+    the mapping settles a variable's term kind this is decided at translation time; elsewhere it is
+    read from the variable's `d_<var>` tag column, which a CONSTRUCT always requests for its
+    template variables.
+  - A template predicate must be an IRI, `a`, or a variable; a property path throws
+    `TranslationError`.
+  - The vocabulary check reads only the WHERE clause, so a template may introduce new classes and
+    properties.
 - **Property paths**: `^` (inverse), `/` (sequence), `|` (alternative), `?` (zero-or-one),
   `+` (one-or-more), `*` (zero-or-more), and negated property sets (`!(:a|^:b)`) are all supported,
   alongside a constant IRI/`a` or a bare variable. `^`/`/`/`|`/`?`/negated-property-sets desugar into

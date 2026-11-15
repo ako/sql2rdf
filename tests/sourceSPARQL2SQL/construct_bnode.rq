@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.com/ns#>
+# A template blank node is fresh per solution, and shared within one.
+CONSTRUCT { ?e ex:card _:c . _:c ex:cardName ?n . }
+WHERE { ?e a ex:Employee ; ex:name ?n }

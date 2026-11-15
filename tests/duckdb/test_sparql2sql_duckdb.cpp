@@ -2032,3 +2032,112 @@ TEST_CASE("native pushdown: constant IRIs and numeric FILTERs compare typed colu
 		CHECK(sorted(withCatalog) == sorted(withoutCatalog));
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CONSTRUCT: rows are triples in read_rdf's columns. A blank node is "_:label",
+// a literal always has a datatype (xsd:string when the mapping leaves it open),
+// and an IRI object has neither datatype nor language.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const char *const kXsdString = "http://www.w3.org/2001/XMLSchema#string";
+
+Row triple(const std::string &s, const std::string &p, const std::string &o, const std::string &dt,
+           const std::string &lang) {
+	return {{"SUBJECT", s}, {"PREDICATE", p}, {"OBJECT", o}, {"OBJECT_DATATYPE", dt}, {"OBJECT_LANG", lang}};
+}
+
+std::size_t countWhere(const std::vector<Row> &rows, const std::string &col, const std::string &value) {
+	return static_cast<std::size_t>(
+	    std::count_if(rows.begin(), rows.end(), [&](const Row &r) { return r.at(col) == value; }));
+}
+
+} // namespace
+
+TEST_CASE("construct_basic.rq: one triple per template triple and solution, unbound ones left out") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "construct_basic.rq", "example_emp_dept.ttl");
+	REQUIRE(rows.size() == 3);
+	const std::string ns = "http://example.com/ns#";
+	CHECK(containsRow(rows, triple("http://data.example.com/employee/7369", ns + "label", "SMITH", kXsdString, kNull)));
+	CHECK(containsRow(rows, triple("http://data.example.com/employee/7400", ns + "label", "JONES", kXsdString, kNull)));
+	CHECK(containsRow(rows, triple("http://data.example.com/employee/7369", ns + "inDept",
+	                               "http://data.example.com/department/10", kNull, kNull)));
+}
+
+TEST_CASE("construct_bnode.rq: a template blank node is fresh per solution and shared within it") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "construct_bnode.rq", "example_emp_dept.ttl");
+	REQUIRE(rows.size() == 4);
+	std::map<std::string, std::string> cardOf; // employee -> blank node
+	std::map<std::string, std::string> nameOf; // blank node -> name
+	for (const auto &r : rows) {
+		if (r.at("PREDICATE") == "http://example.com/ns#card") {
+			cardOf[r.at("SUBJECT")] = r.at("OBJECT");
+		} else {
+			nameOf[r.at("SUBJECT")] = r.at("OBJECT");
+		}
+	}
+	REQUIRE(cardOf.size() == 2);
+	const std::string smith = cardOf.at("http://data.example.com/employee/7369");
+	const std::string jones = cardOf.at("http://data.example.com/employee/7400");
+	CHECK(smith != jones);
+	CHECK(smith.rfind("_:c_", 0) == 0);
+	CHECK(nameOf.at(smith) == "SMITH");
+	CHECK(nameOf.at(jones) == "JONES");
+}
+
+TEST_CASE("construct_where.rq: the short form uses the WHERE pattern as the template") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "construct_where.rq", "example_emp_dept.ttl");
+	REQUIRE(rows.size() == 2);
+	CHECK(containsRow(rows, triple("http://data.example.com/department/10", "http://example.com/ns#location",
+	                               "NEW YORK", kXsdString, kNull)));
+}
+
+TEST_CASE("construct_literal_subject.rq: a triple that would have a literal subject is dropped") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "construct_literal_subject.rq", "example_emp_dept.ttl");
+	REQUIRE(rows.size() == 2);
+	CHECK(countWhere(rows, "PREDICATE", "http://example.com/ns#n") == 2);
+}
+
+TEST_CASE("construct_dedup.rq: the same triple from several solutions appears once") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "construct_dedup.rq", "example_emp_dept.ttl");
+	REQUIRE(rows.size() == 1);
+}
+
+TEST_CASE("construct_limit.rq: ORDER BY and LIMIT apply to solutions") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "construct_limit.rq", "example_emp_dept.ttl");
+	REQUIRE(rows.size() == 1);
+	CHECK(rows[0].at("OBJECT") == "JONES");
+}
+
+TEST_CASE("construct_mixed_kind.rq: the term kind is decided per row") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "construct_mixed_kind.rq", "sparql2sql_terms.ttl");
+	const std::size_t copies = countWhere(rows, "PREDICATE", "http://example.com/ns#copy");
+	const std::size_t backs = countWhere(rows, "PREDICATE", "http://example.com/ns#back");
+	CHECK(copies == 4);
+	// Only the two IRI objects can be the subject of ex:back.
+	CHECK(backs == 2);
+	for (const auto &r : rows) {
+		if (r.at("PREDICATE") != "http://example.com/ns#copy") {
+			continue;
+		}
+		const bool iri = r.at("OBJECT").rfind("http://", 0) == 0;
+		INFO("object " << r.at("OBJECT"));
+		CHECK((r.at("OBJECT_DATATYPE") == kNull) == iri);
+	}
+}
+
+TEST_CASE("construct_mixed_datatype.rq: each literal keeps its own row's datatype") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "construct_mixed_datatype.rq", "sparql2sql_terms.ttl");
+	CHECK(countWhere(rows, "OBJECT_DATATYPE", "http://www.w3.org/2001/XMLSchema#integer") == 2);
+	CHECK(countWhere(rows, "OBJECT_DATATYPE", kXsdString) >= 1);
+	CHECK(countWhere(rows, "OBJECT_DATATYPE", kNull) == 0);
+}

@@ -5,6 +5,9 @@
 #include <vector>
 
 #include "sparql-parser/ast/Expression.h"
+#include "sparql-parser/ast/GraphPattern.h"
+#include "sparql-parser/ast/Path.h"
+#include "sparql-parser/ast/Term.h"
 #include "sparql-parser/ast/Query.h"
 #include "sparql2sql/GraphConstraint.h"
 #include "sparql2sql/ExpressionTranslator.h"
@@ -329,13 +332,33 @@ std::string prependCtes(const TranslationContext &ctx, const std::string &body) 
 }
 
 TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, TranslationContext &ctx, bool nested) {
-	if (query.form != QueryForm::Select) {
+	// CONSTRUCT is translated as `SELECT *` over its WHERE clause, every
+	// solution modifier included; translateConstruct then instantiates the
+	// template over the resulting rows.
+	const bool construct = query.form == QueryForm::Construct;
+	if (query.form != QueryForm::Select && !construct) {
 		throw TranslationError(
 		    "translateQueryPattern: only SELECT queries produce a projected relation (subqueries and the top-level "
 		    "SELECT path both require the SELECT form)");
 	}
+	const bool selectStar = query.selectStar || construct;
 
 	const SqlDialect &dialect = ctx.dialect();
+	if (construct) {
+		// The template needs every variable's term kind, datatype and language
+		// to build its triples; where the mapping does not settle them, they
+		// have to come out of this relation as tag columns.
+		for (const auto &tp : query.constructTemplate) {
+			for (const sparql::ast::Term *t : {tp.subject.get(), tp.object.get()}) {
+				if (t != nullptr && t->kind() == sparql::ast::TermKind::Var) {
+					ctx.markNeedsTag(static_cast<const sparql::ast::Var *>(t)->name);
+				}
+			}
+			if (tp.predicate && tp.predicate->kind() == sparql::ast::PathKind::Variable) {
+				ctx.markNeedsTag(static_cast<const sparql::ast::VariablePath &>(*tp.predicate).var->name);
+			}
+		}
+	}
 
 	// Must run before fold(): a nested `{ SELECT ... }` sub-select inside
 	// query.where folds (and renders its final SQL text) as one step of
@@ -408,10 +431,10 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 	// Both are gated on the dimension not being statically determined, so an
 	// ordinary query's result columns stay exactly the variables it projected.
 	const bool dedup = query.distinct || query.reduced;
-	const bool wantTagCols = nested || dedup;
+	const bool wantTagCols = nested || dedup || construct;
 	std::set<std::string> tagCols;
 	std::vector<std::string> selectCols = groupBy.selectListPrefixCols;
-	if (query.selectStar) {
+	if (selectStar) {
 		// Internal variables - property path intermediates and blank-node
 		// positions - are bound and joinable but are not query variables, so
 		// `SELECT *` must not project them.
@@ -459,7 +482,7 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 	// their own (semantically necessary) wrapping, so eliding it here removes
 	// the one layer that is never anything but boilerplate. Splice `source.sql`
 	// straight through instead.
-	bool elideProjection = !query.selectStar && !grouping && !(query.distinct || query.reduced) && havingSql.empty() &&
+	bool elideProjection = !selectStar && !grouping && !(query.distinct || query.reduced) && havingSql.empty() &&
 	                       orderBySql.empty() && !query.solutionModifier.hasLimit &&
 	                       !query.solutionModifier.hasOffset && tagCols.empty();
 	std::vector<std::string> bareOutputVars;
@@ -503,7 +526,7 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 	TranslatedPattern result;
 	result.sql = sql;
 	result.providedTagVars = tagCols;
-	if (query.selectStar) {
+	if (selectStar) {
 		for (const auto &v : source.boundVars) {
 			if (!ctx.isInternal(v)) {
 				result.boundVars.insert(v);
@@ -536,6 +559,246 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 	}
 	return result;
 }
+
+namespace {
+
+// One template position of a CONSTRUCT, rendered against the solution rows.
+struct ConstructTermSql {
+	bool possible = true;           // false: this position can never hold a valid term here
+	std::string value;              // the term as text: an IRI, "_:label", or a literal's lexical form
+	std::string datatype;           // the literal's datatype IRI as SQL, or NULL
+	std::string lang;               // the literal's language tag as SQL, or NULL
+	std::vector<std::string> conds; // row conditions under which the term is valid
+};
+
+enum class TemplatePosition { Subject, Predicate, Object };
+
+ConstructTermSql constantLiteralTerm(const sparql::ast::RdfLiteral &lit, const SqlDialect &dialect) {
+	ConstructTermSql out;
+	out.value = dialect.stringLiteral(lit.lexicalForm);
+	if (!lit.languageTag.empty()) {
+		out.datatype = dialect.stringLiteral(kRdfLangString);
+		out.lang = dialect.stringLiteral(lit.languageTag);
+	} else {
+		out.datatype = dialect.stringLiteral(lit.datatype ? lit.datatype->value : std::string(xsd::kString));
+		out.lang = "NULL";
+	}
+	return out;
+}
+
+// A variable's term: its value column plus a tag (a constant when the mapping
+// settles the term's dimension, else the tag column translateQueryPattern
+// projected for it). SPARQL 1.1 Section 16.2: a triple whose variable is
+// unbound, or that would put a literal in subject position or a non-IRI in
+// predicate position, is left out - the rest of the solution still counts.
+ConstructTermSql variableTerm(const std::string &name, const TranslatedPattern &src, const std::string &alias,
+                              TemplatePosition pos, const SqlDialect &dialect) {
+	ConstructTermSql out;
+	if (src.allVars().count(name) == 0) {
+		out.possible = false; // never bound by the WHERE clause
+		return out;
+	}
+	const std::string col = alias + "." + mangleVar(name, dialect);
+	const TermInfo info = src.termInfoOf(name);
+	std::string tag;
+	if (src.providedTagVars.count(name) != 0) {
+		tag = alias + "." + mangleVarTag(name, dialect);
+	} else {
+		tag = tagLiteral(info, dialect);
+		if (tag.empty()) {
+			throw TranslationError("CONSTRUCT: the RDF term kind of ?" + name +
+			                       " is neither determined by the mapping nor available as a runtime tag");
+		}
+	}
+	const bool staticKind = isFullyDetermined(info);
+	out.conds.push_back(col + " IS NOT NULL");
+	if (pos == TemplatePosition::Subject) {
+		if (staticKind && info.kind == RdfTermKind::Literal) {
+			out.possible = false;
+			return out;
+		}
+		if (!staticKind) {
+			out.conds.push_back("(" + tagIsKind(tag, RdfTermKind::Iri, dialect) + " OR " +
+			                    tagIsKind(tag, RdfTermKind::BlankNode, dialect) + ")");
+		}
+	} else if (pos == TemplatePosition::Predicate) {
+		if (staticKind && info.kind != RdfTermKind::Iri) {
+			out.possible = false;
+			return out;
+		}
+		if (!staticKind) {
+			out.conds.push_back(tagIsKind(tag, RdfTermKind::Iri, dialect));
+		}
+	}
+	const std::string blankText = dialect.concat({dialect.stringLiteral("_:"), col});
+	if (staticKind) {
+		out.value = info.kind == RdfTermKind::BlankNode ? blankText : col;
+		out.datatype = "NULL";
+		out.lang = "NULL";
+		if (info.kind == RdfTermKind::Literal) {
+			// A literal whose datatype the mapping leaves open is a plain
+			// literal, which RDF 1.1 types as xsd:string.
+			out.datatype = dialect.stringLiteral(!info.datatypeIri.empty() ? info.datatypeIri
+			                                     : !info.lang.empty()      ? std::string(kRdfLangString)
+			                                                               : std::string(xsd::kString));
+			out.lang = info.lang.empty() ? "NULL" : dialect.stringLiteral(info.lang);
+		}
+		return out;
+	}
+	const std::string isBlank = tagIsKind(tag, RdfTermKind::BlankNode, dialect);
+	const std::string isLiteral = tagIsKind(tag, RdfTermKind::Literal, dialect);
+	out.value = "(CASE WHEN " + isBlank + " THEN " + blankText + " ELSE " + col + " END)";
+	// An untagged literal ("L": the mapping does not say) is a plain literal,
+	// which RDF 1.1 types as xsd:string.
+	out.datatype = "(CASE WHEN " + isLiteral + " THEN COALESCE(" + tagDatatypeIri(tag, dialect) + ", " +
+	               dialect.stringLiteral(xsd::kString) + ") END)";
+	out.lang = "NULLIF(" + tagLang(tag, dialect) + ", '')";
+	return out;
+}
+
+ConstructTermSql templateTerm(const sparql::ast::Term &term, const TranslatedPattern &src, const std::string &alias,
+                              TemplatePosition pos, const SqlDialect &dialect) {
+	ConstructTermSql out;
+	switch (term.kind()) {
+	case sparql::ast::TermKind::Var:
+		return variableTerm(static_cast<const sparql::ast::Var &>(term).name, src, alias, pos, dialect);
+	case sparql::ast::TermKind::Iri:
+		out.value = dialect.stringLiteral(static_cast<const sparql::ast::Iri &>(term).value);
+		out.datatype = "NULL";
+		out.lang = "NULL";
+		return out;
+	case sparql::ast::TermKind::BlankNode:
+		if (pos == TemplatePosition::Predicate) {
+			out.possible = false;
+			return out;
+		}
+		// A fresh blank node per solution (Section 16.2): the label plus the
+		// solution's row number.
+		out.value =
+		    dialect.concat({dialect.stringLiteral("_:" + static_cast<const sparql::ast::BlankNode &>(term).label + "_"),
+		                    "CAST(" + alias + "." + dialect.quoteIdentifier("_sol") + " AS VARCHAR)"});
+		out.datatype = "NULL";
+		out.lang = "NULL";
+		return out;
+	case sparql::ast::TermKind::Literal:
+		if (pos != TemplatePosition::Object) {
+			out.possible = false;
+			return out;
+		}
+		return constantLiteralTerm(static_cast<const sparql::ast::RdfLiteral &>(term), dialect);
+	}
+	throw std::logic_error("templateTerm: unhandled TermKind");
+}
+
+bool templateHasBlankNode(const sparql::ast::Query &query) {
+	for (const auto &tp : query.constructTemplate) {
+		if ((tp.subject && tp.subject->kind() == sparql::ast::TermKind::BlankNode) ||
+		    (tp.object && tp.object->kind() == sparql::ast::TermKind::BlankNode)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// CONSTRUCT: the WHERE clause as `SELECT *` (with its solution modifiers), then
+// one arm per template triple, combined with UNION so the result is a set of
+// triples, as an RDF graph is. Columns follow read_rdf's: subject, predicate,
+// object, object_datatype, object_lang. Blank nodes are written "_:label"; a
+// literal always has a datatype (xsd:string for a plain one, rdf:langString
+// with a language tag); an IRI object has neither.
+std::string translateConstruct(const sparql::ast::Query &query, TranslationContext &ctx) {
+	const SqlDialect &dialect = ctx.dialect();
+	TranslatedPattern src = translateQueryPattern(query, ctx);
+	const std::string alias = ctx.nextAlias();
+	std::string from = "(" + src.sql + ")";
+	if (templateHasBlankNode(query)) {
+		const std::string inner = ctx.nextAlias();
+		from = "(SELECT " + inner + ".*, ROW_NUMBER() OVER () AS " + dialect.quoteIdentifier("_sol") + " FROM " + from +
+		       " AS " + inner + ")";
+	}
+	const std::vector<std::string> columns = {"subject", "predicate", "object", "object_datatype", "object_lang"};
+	struct Arm {
+		std::vector<std::string> values; // one SQL expression per output column
+		std::string cond;                // empty: always valid
+	};
+	std::vector<Arm> arms;
+	for (const auto &tp : query.constructTemplate) {
+		if (!tp.subject || !tp.predicate || !tp.object) {
+			continue;
+		}
+		ConstructTermSql s = templateTerm(*tp.subject, src, alias, TemplatePosition::Subject, dialect);
+		ConstructTermSql p;
+		if (tp.predicate->kind() == sparql::ast::PathKind::Predicate) {
+			p.value = dialect.stringLiteral(static_cast<const sparql::ast::PredicatePath &>(*tp.predicate).iri->value);
+		} else if (tp.predicate->kind() == sparql::ast::PathKind::Variable) {
+			p = variableTerm(static_cast<const sparql::ast::VariablePath &>(*tp.predicate).var->name, src, alias,
+			                 TemplatePosition::Predicate, dialect);
+		} else {
+			throw TranslationError("CONSTRUCT: a template triple's predicate must be an IRI or a variable, not a "
+			                       "property path");
+		}
+		ConstructTermSql o = templateTerm(*tp.object, src, alias, TemplatePosition::Object, dialect);
+		if (!s.possible || !p.possible || !o.possible) {
+			continue;
+		}
+		Arm arm;
+		arm.values = {s.value, p.value, o.value, o.datatype, o.lang};
+		for (const auto *t : {&s, &p, &o}) {
+			for (const auto &c : t->conds) {
+				arm.cond += (arm.cond.empty() ? "" : " AND ") + c;
+			}
+		}
+		arms.push_back(std::move(arm));
+	}
+	if (arms.empty()) {
+		std::string none = "SELECT";
+		for (std::size_t i = 0; i < columns.size(); ++i) {
+			none += std::string(i > 0 ? "," : "") + " CAST(NULL AS VARCHAR) AS " + dialect.quoteIdentifier(columns[i]);
+		}
+		return none + " WHERE " + dialect.booleanLiteral(false);
+	}
+
+	// Every template triple from ONE scan of the solutions: each solution row is
+	// paired with each triple's number, and CASE picks that triple's terms.
+	// DISTINCT makes the result a set of triples, as an RDF graph is.
+	const bool single = arms.size() == 1;
+	const std::string armAlias = ctx.nextAlias();
+	const std::string armCol = armAlias + "." + dialect.quoteIdentifier("_arm");
+	std::string sql = "SELECT DISTINCT";
+	for (std::size_t c = 0; c < columns.size(); ++c) {
+		std::string expr;
+		if (single) {
+			expr = arms[0].values[c];
+		} else {
+			expr = "CASE " + armCol;
+			for (std::size_t a = 0; a < arms.size(); ++a) {
+				expr += " WHEN " + std::to_string(a + 1) + " THEN " + arms[a].values[c];
+			}
+			expr += " END";
+		}
+		sql +=
+		    std::string(c > 0 ? "," : "") + " CAST(" + expr + " AS VARCHAR) AS " + dialect.quoteIdentifier(columns[c]);
+	}
+	sql += " FROM " + from + " AS " + alias;
+	if (!single) {
+		sql += " CROSS JOIN (VALUES";
+		for (std::size_t a = 0; a < arms.size(); ++a) {
+			sql += std::string(a > 0 ? "," : "") + " (" + std::to_string(a + 1) + ")";
+		}
+		sql += ") AS " + armAlias + "(" + dialect.quoteIdentifier("_arm") + ")";
+	}
+	std::string where;
+	for (std::size_t a = 0; a < arms.size(); ++a) {
+		std::string cond = arms[a].cond.empty() ? dialect.booleanLiteral(true) : arms[a].cond;
+		if (!single) {
+			cond = armCol + " = " + std::to_string(a + 1) + " AND " + cond;
+		}
+		where += std::string(a > 0 ? " OR " : "") + "(" + cond + ")";
+	}
+	return sql + " WHERE " + where;
+}
+
+} // namespace
 
 std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMapping &mapping,
                            const SqlDialect &dialect, const TypeCatalog *catalog, bool prettyPrint) {
@@ -604,9 +867,13 @@ std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMa
 		                   "SELECT " + dialect.existsClause(false, innerSql) + " AS " + dialect.quoteIdentifier("ask"));
 	}
 
+	if (query.form == QueryForm::Construct) {
+		return prependCtes(ctx, translateConstruct(query, ctx));
+	}
+
 	if (query.form != QueryForm::Select) {
 		throw TranslationError(
-		    "query form not supported (only SELECT and ASK are implemented; CONSTRUCT/DESCRIBE are not)");
+		    "query form not supported (only SELECT, ASK and CONSTRUCT are implemented; DESCRIBE is not)");
 	}
 
 	TranslatedPattern result = translateQueryPattern(query, ctx);

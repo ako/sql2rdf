@@ -1,0 +1,5 @@
+PREFIX ex: <http://example.com/ns#>
+# ex:mixed is an IRI in one map and a literal in the other: the kind is
+# decided per row, so ex:back exists only where ?x is an IRI.
+CONSTRUCT { ?m ex:copy ?x . ?x ex:back ?m . }
+WHERE { ?m ex:mixed ?x }

@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.com/ns#>
+# OPTIONAL: JONES has no department, so only his ex:inDept triple is left out.
+CONSTRUCT { ?e ex:label ?n ; ex:inDept ?d . }
+WHERE { ?e a ex:Employee ; ex:name ?n OPTIONAL { ?e ex:department ?d } }

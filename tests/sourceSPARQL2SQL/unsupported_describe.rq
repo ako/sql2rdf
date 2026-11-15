@@ -1,5 +1,5 @@
 PREFIX ex: <http://example.com/ns#>
-CONSTRUCT { ?e ex:name ?n . }
+DESCRIBE ?e
 WHERE {
   ?e ex:name ?n .
 }
