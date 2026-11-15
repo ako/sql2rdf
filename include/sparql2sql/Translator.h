@@ -54,6 +54,23 @@ struct TypeCatalog;
 /// is a constant the outer renderer can synthesise on demand. The top-level call
 /// leaves them off so an ordinary query's result columns stay exactly the
 /// variables it projected.
+/// Options for translateQuery beyond the catalog.
+struct TranslateOptions {
+	/// Lay the SQL out for reading (see the bool overload).
+	bool prettyPrint = false;
+	/// Return each SELECT output column whose datatype the mapping settles as
+	/// a native SQL value instead of its VARCHAR lexical form: an integer
+	/// type, DECIMAL, DOUBLE, BOOLEAN, DATE or TIMESTAMP (the declared type of
+	/// the base column where it is a bare copy of one). IRIs, blank nodes,
+	/// strings and anything whose datatype varies per row stay VARCHAR. Only
+	/// SELECT is affected; ASK and CONSTRUCT keep their fixed shapes.
+	bool typedResults = false;
+};
+
+[[nodiscard]] std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMapping &mapping,
+                                         const SqlDialect &dialect, const TypeCatalog *catalog,
+                                         const TranslateOptions &options);
+
 [[nodiscard]] TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, TranslationContext &ctx,
                                                       bool nested = false);
 

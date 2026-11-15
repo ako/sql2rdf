@@ -29,6 +29,8 @@ public:
 	std::string anyValueAgg(const std::string &expr) const override;
 	std::string argMinMaxBy(const std::string &expr, const std::string &orderBy, bool wantMax) const override;
 	std::string combineByName(bool all, const std::vector<std::string> &armSqls) const override;
+	std::string replaceColumns(const std::string &innerSql, const std::string &alias,
+	                           const std::vector<std::pair<std::string, std::string>> &replacements) const override;
 };
 
 } // namespace sparql2sql
