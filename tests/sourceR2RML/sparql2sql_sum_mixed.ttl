@@ -1,0 +1,37 @@
+@prefix rr:  <http://www.w3.org/ns/r2rml#> .
+@prefix ex:  <http://example.com/ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Typed numeric columns next to a generic triple map (predicate from a
+# column), as when ontology triples are mapped alongside the data. The generic
+# arm is a candidate for every predicate, so the mapping alone no longer
+# settles a SUM argument's type; SUM has to decide from the rows' tags.
+<#Generic>
+    rr:logicalTable [ rr:tableName "GENERIC_TRIPLES" ] ;
+    rr:subjectMap [ rr:column "S" ] ;
+    rr:predicateObjectMap [
+        rr:predicateMap [ rr:column "P" ] ;
+        rr:objectMap [ rr:column "O" ]
+    ] .
+
+# ex:qty - integers only (plus a non-numeric generic row, which SUM skips).
+# ex:amount - integers and decimals. ex:value - integers and doubles.
+<#Measures>
+    rr:logicalTable [ rr:tableName "MEASURES" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/measure/{ID}" ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:qty, ex:amount, ex:value ;
+        rr:objectMap [ rr:column "AMOUNT" ; rr:datatype xsd:integer ]
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:value ;
+        rr:objectMap [ rr:column "PRICE" ; rr:datatype xsd:double ]
+    ] .
+
+<#Payments>
+    rr:logicalTable [ rr:tableName "PAYMENTS" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/payment/{ID}" ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:amount ;
+        rr:objectMap [ rr:column "AMOUNT" ; rr:datatype xsd:decimal ]
+    ] .

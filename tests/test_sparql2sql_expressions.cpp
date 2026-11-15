@@ -581,6 +581,25 @@ TEST_CASE("BIND: COALESCE, IF, SAMETERM, and ISNUMERIC") {
 	CHECK(sql.find("CASE WHEN") != std::string::npos);
 }
 
+TEST_CASE("Aggregates: SUM picks its result type from the rows' tags when the mapping does not settle it") {
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_sum_mixed.ttl");
+	// A generic triple map is a candidate for ex:qty beside the xsd:integer
+	// column, so the static type is unknown and SUM dispatches per group.
+	std::string sql = translate("SELECT (SUM(?x) AS ?t) WHERE { ?s ex:qty ?x }", mapping);
+	CHECK(sql.find("COALESCE(MAX((CASE WHEN") != std::string::npos);
+	CHECK(sql.find("TRY_CAST") != std::string::npos);
+	CHECK(sql.find(" AS BIGINT)") != std::string::npos);
+	CHECK(sql.find(" AS DOUBLE)") != std::string::npos);
+
+	// A fully typed argument keeps its single static form.
+	R2RMLParser plainParser;
+	R2RMLMapping plain = plainParser.parse(SOURCE_R2RML_DIR "sparql2sql_decimal.ttl");
+	std::string typed = translate("SELECT (SUM(?x) AS ?t) WHERE { ?s ex:paid ?x }", plain);
+	CHECK(typed.find("COALESCE(MAX(") == std::string::npos);
+	CHECK(typed.find(" AS DOUBLE)") == std::string::npos);
+}
+
 TEST_CASE("Aggregates: SUM/AVG/MIN/MAX/SAMPLE/GROUP_CONCAT with DISTINCT") {
 	R2RMLParser mappingParser;
 	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "example_emp_dept.ttl");

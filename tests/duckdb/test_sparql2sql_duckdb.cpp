@@ -122,6 +122,14 @@ std::unique_ptr<DuckDBConnection> makeSeededDatabase() {
 	conn->execute("CREATE TABLE PAYMENTS (ID INTEGER, AMOUNT DECIMAL(10,2))");
 	conn->execute("INSERT INTO PAYMENTS VALUES (1, 0.10), (2, 0.20), (3, 5.00)");
 
+	// Generic triple map rows for sparql2sql_sum_mixed.ttl. The ex:qty row has
+	// no numeric reading, so SUM must skip it without giving up its integral
+	// result; ex:note exists only so the table is not empty.
+	conn->execute("CREATE TABLE GENERIC_TRIPLES (S VARCHAR, P VARCHAR, O VARCHAR)");
+	conn->execute("INSERT INTO GENERIC_TRIPLES VALUES "
+	              "('http://ex.org/x', 'http://example.com/ns#qty', 'n/a'), "
+	              "('http://ex.org/x', 'http://example.com/ns#note', 'hello')");
+
 	// Blank-node-subject fixture, and the literal-valued arm of the four
 	// multi-arm predicates (ex:mixed / ex:desc / ex:mixedtag / ex:mixeddt).
 	//
@@ -1728,6 +1736,23 @@ TEST_CASE("dyn_minmax_mixed.rq: MIN reports the winning row's own datatype") {
 	REQUIRE(dt != rows[0].end());
 	CHECK(lo->second == "100");
 	CHECK(dt->second == "http://www.w3.org/2001/XMLSchema#integer");
+}
+
+TEST_CASE("sum_mixed_*.rq: SUM over typed columns plus a generic triple map keeps the narrowest exact type") {
+	// The generic arm makes each SUM argument's type unknown at translation
+	// time, so the result type comes from the rows' tags.
+	auto conn = makeSeededDatabase();
+	auto total = [&](const char *rq) {
+		auto rows = translateAndRun(*conn, rq, "sparql2sql_sum_mixed.ttl");
+		REQUIRE(rows.size() == 1);
+		return rows[0].at("V_TOTAL");
+	};
+	// 9 + 100, the generic 'n/a' row skipped: still an integer, not "109.0".
+	CHECK(total("sum_mixed_qty.rq") == "109");
+	// Integers and decimals: fixed-point 9 + 100 + 0.10 + 0.20 + 5.00.
+	CHECK(total("sum_mixed_amount.rq") == "114.3");
+	// Integers and doubles: 9 + 100 + 2.5 + 10.0.
+	CHECK(total("sum_mixed_value.rq") == "121.5");
 }
 
 TEST_CASE("dyn_iri_construct.rq: IRI() re-tags a literal as an IRI term") {

@@ -749,6 +749,22 @@ std::string translateAggregate(const AggregateExpr &agg, const TranslatedPattern
 		if (argInfo.datatypeIri == xsd::kDecimal) {
 			return dialect.decimalToLexical("SUM(" + distinctPrefix + dialect.tryCastToDecimal(arg) + ")");
 		}
+		// The mapping does not settle the type - typically because a generic
+		// triple map (predicate from a column) is a candidate beside a typed
+		// column. Decide per group from the rows' tags: integral when every
+		// numeric row is, fixed-point when they are integers and decimals, DOUBLE
+		// otherwise. Without this, one untyped candidate arm turns every integer
+		// total into "231000.0", even when that arm contributes no rows.
+		if (tagLiteral(argInfo, dialect).empty()) {
+			const TermSql term = trTerm(*agg.arg, scope, alias, ctx);
+			if (!term.tag.empty()) {
+				const std::string sumClass = "COALESCE(MAX(" + tagSumClass(term.tag, term.value, dialect) + "), 0)";
+				return "(CASE " + sumClass + " WHEN 0 THEN CAST(SUM(" + distinctPrefix + dialect.tryCastToBigInt(arg) +
+				       ") AS VARCHAR) WHEN 1 THEN " +
+				       dialect.decimalToLexical("SUM(" + distinctPrefix + dialect.tryCastToDecimal(arg) + ")") +
+				       " ELSE CAST(SUM(" + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR) END)";
+			}
+		}
 		return "CAST(SUM(" + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR)";
 	case AggregateKind::Avg:
 		return "CAST(AVG(" + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR)";

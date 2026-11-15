@@ -101,6 +101,16 @@ std::string tagLang(const std::string &tagSql, const SqlDialect &dialect);
 /// value space - the runtime half of isNUMERIC().
 std::string tagIsNumeric(const std::string &tagSql, const SqlDialect &dialect);
 
+/// How a row whose term is `valueSql` tagged `tagSql` steers a
+/// dynamically-typed SUM's result type, as an integer: 0 = integral, or does
+/// not take part (unbound, IRI, blank node, a non-numeric typed literal, or an
+/// kTagLiteralUntyped value with no numeric reading - all skipped by the SUM's
+/// TRY_CASTs), 1 = xsd:decimal, 2 = xsd:double/xsd:float, or an untyped
+/// literal whose text reads as a number (its exact type is unknown, so it gets
+/// the old DOUBLE treatment). MAX() of this over a group picks the narrowest
+/// result type that is exact for every contributing row.
+std::string tagSumClass(const std::string &tagSql, const std::string &valueSql, const SqlDialect &dialect);
+
 /// SPARQL 1.1 Section 15.1's ordering rank across term kinds: unbound (0) <
 /// blank node (1) < IRI (2) < literal (3). The first sort key of a
 /// dynamically-typed ORDER BY; tagValueSpace() serves as the second, since its

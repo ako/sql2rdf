@@ -116,6 +116,14 @@ std::string tagIsNumeric(const std::string &tagSql, const SqlDialect &dialect) {
 	return "(" + tagValueSpace(tagSql, dialect) + " = " + intLiteral(kValueSpaceNumeric) + ")";
 }
 
+std::string tagSumClass(const std::string &tagSql, const std::string &valueSql, const SqlDialect &dialect) {
+	const std::vector<const char *> floating = {xsd::kDouble, xsd::kFloat};
+	return "(CASE WHEN " + tagSql + " = " + datatypeTagLiteral(xsd::kDecimal, dialect) + " THEN 1" + //
+	       " WHEN " + tagInDatatypes(tagSql, floating, dialect) + " THEN 2" +                        //
+	       " WHEN " + tagSql + " = " + dialect.stringLiteral(kTagLiteralUntyped) + " AND " +         //
+	       dialect.tryCastToDouble(valueSql) + " IS NOT NULL THEN 2 ELSE 0 END)";
+}
+
 std::string tagKindRank(const std::string &tagSql, const SqlDialect &dialect) {
 	return "(CASE WHEN " + tagSql + " IS NULL THEN 0 WHEN " + tagSql + " = " + dialect.stringLiteral(kTagBlankNode) +
 	       " THEN 1 WHEN " + tagSql + " = " + dialect.stringLiteral(kTagIri) + " THEN 2 ELSE 3 END)";
