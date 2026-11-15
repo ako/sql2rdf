@@ -1,0 +1,31 @@
+@prefix rr:  <http://www.w3.org/ns/r2rml#> .
+@prefix ex:  <http://example.com/ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Integer, double and decimal columns, plus an IRI built from an integer key.
+# With a type catalog, a constant IRI and a numeric FILTER should compare
+# these columns directly (pushable into Postgres / Parquet scans) instead of
+# through their text form.
+<#Measures>
+    rr:logicalTable [ rr:tableName "MEASURES" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/measure/{ID}" ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:ref ;
+        rr:objectMap [ rr:template "http://data.example.com/measure/{REF}" ]
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:amount ;
+        rr:objectMap [ rr:column "AMOUNT" ; rr:datatype xsd:integer ]
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:price ;
+        rr:objectMap [ rr:column "PRICE" ; rr:datatype xsd:double ]
+    ] .
+
+<#Payments>
+    rr:logicalTable [ rr:tableName "PAYMENTS" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/payment/{ID}" ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:paid ;
+        rr:objectMap [ rr:column "AMOUNT" ; rr:datatype xsd:decimal ]
+    ] .

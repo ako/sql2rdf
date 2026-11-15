@@ -925,8 +925,18 @@ bool foldConjunctIntoSpj(SpjRelation &spj, const sparql::ast::Expression &pred, 
 	fillScopeFromSchema(scope, spj.schema());
 
 	std::string sentinel = ctx.nextAlias();
+	std::map<std::string, std::string> nativeRefs;
+	if (const TypeCatalog *catalog = ctx.catalog()) {
+		for (const auto &c : spj.schema()) {
+			if (c.prov == Provenance::PureColumn && !c.nativeColumnRef.empty() && !c.tableIdentity.empty() &&
+			    catalog->isNumericType(c.tableIdentity, c.columnName)) {
+				nativeRefs[c.var] = c.nativeColumnRef;
+			}
+		}
+	}
 	std::string sql;
 	try {
+		TranslationContext::NativeNumericGuard guard(ctx, sentinel, std::move(nativeRefs));
 		sql = translateExpression(pred, scope, sentinel, ctx);
 	} catch (const TranslationError &) {
 		// This block cannot render the predicate - most often because the term

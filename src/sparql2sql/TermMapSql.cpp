@@ -52,6 +52,44 @@ std::string columnExpr(const std::string &sourceAlias, const std::string &column
 	return "CAST(" + sourceAlias + "." + dialect.quoteIdentifier(columnName) + " AS VARCHAR)";
 }
 
+// Whether `text` is exactly how DuckDB/SQL renders an integer as VARCHAR:
+// optional '-', no leading zeros, no '+', no whitespace, at most 18 digits (so
+// it always fits a BIGINT literal). "-0" is excluded: CAST(0 AS VARCHAR) is "0".
+bool isCanonicalIntegerText(const std::string &text) {
+	std::size_t i = (!text.empty() && text[0] == '-') ? 1 : 0;
+	const std::size_t digits = text.size() - i;
+	if (digits == 0 || digits > 18) {
+		return false;
+	}
+	for (std::size_t j = i; j < text.size(); ++j) {
+		if (text[j] < '0' || text[j] > '9') {
+			return false;
+		}
+	}
+	if (text[i] == '0') {
+		return digits == 1 && i == 0;
+	}
+	return true;
+}
+
+// The condition "this column's lexical form equals `value`". For a column the
+// catalog declares as an integer type this compares the column itself with an
+// integer literal - CAST(col AS VARCHAR) = '1' holds exactly when col = 1, and
+// the uncast form can be pushed into a remote scan (Postgres) or checked
+// against Parquet/Iceberg min-max statistics. Text that is not a canonical
+// integer can never equal an integer's VARCHAR rendering, so it folds to FALSE.
+// Every other column keeps the lexical comparison.
+std::string columnEqualsText(const std::string &sourceAlias, const std::string &columnName, const std::string &value,
+                             const SqlDialect &dialect, const TypeCatalog *catalog, const std::string &tableIdentity) {
+	if (catalog != nullptr && !tableIdentity.empty() && catalog->isIntegerType(tableIdentity, columnName)) {
+		if (!isCanonicalIntegerText(value)) {
+			return dialect.booleanLiteral(false);
+		}
+		return sourceAlias + "." + dialect.quoteIdentifier(columnName) + " = " + value;
+	}
+	return columnExpr(sourceAlias, columnName, dialect, catalog, tableIdentity) + " = " + dialect.stringLiteral(value);
+}
+
 std::string qualifiedColumnRef(const std::string &sourceAlias, const std::string &columnName,
                                const SqlDialect &dialect) {
 	return sourceAlias + "." + dialect.quoteIdentifier(columnName);
@@ -239,8 +277,8 @@ InversionResult invertTermMapAgainstBoundTerm(const r2rml::TermMap &termMap, con
 	}
 	if (const auto *col = dynamic_cast<const r2rml::ColumnTermMap *>(&termMap)) {
 		result.possible = true;
-		result.whereConditions.push_back(columnExpr(sourceAlias, col->columnName, dialect, catalog, tableIdentity) +
-		                                 " = " + dialect.stringLiteral(boundValue));
+		result.whereConditions.push_back(
+		    columnEqualsText(sourceAlias, col->columnName, boundValue, dialect, catalog, tableIdentity));
 		return result;
 	}
 	if (const auto *tmpl = dynamic_cast<const r2rml::TemplateTermMap *>(&termMap)) {
@@ -259,8 +297,7 @@ InversionResult invertTermMapAgainstBoundTerm(const r2rml::TermMap &termMap, con
 		}
 		for (const auto &columnValue : outcome.columnValues) {
 			result.whereConditions.push_back(
-			    columnExpr(sourceAlias, columnValue.first, dialect, catalog, tableIdentity) + " = " +
-			    dialect.stringLiteral(columnValue.second));
+			    columnEqualsText(sourceAlias, columnValue.first, columnValue.second, dialect, catalog, tableIdentity));
 		}
 		return result;
 	}
