@@ -2248,6 +2248,62 @@ TEST_CASE("typed results: off by default, so every column stays VARCHAR") {
 }
 
 // ---------------------------------------------------------------------------
+// Result term tags (TranslateOptions::termTags): each output variable gets a
+// d_<var> column telling an IRI from a literal, with datatype or language.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<std::map<std::string, std::string>> taggedRows(DuckDBConnection &conn, const std::string &body) {
+	Parser parser;
+	auto query = parser.parseString("PREFIX ex: <http://example.com/ns#>\n" + body);
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_terms.ttl");
+	DuckDbDialect dialect;
+	sparql2sql::TranslateOptions options;
+	options.termTags = true;
+	const std::string sql = translateQuery(*query, mapping, dialect, nullptr, options);
+	INFO("SQL: " << sql);
+	return collectRows(*conn.execute(sql));
+}
+
+} // namespace
+
+TEST_CASE("term tags: settled tags on every row") {
+	auto conn = makeSeededDatabase();
+	auto rows = taggedRows(*conn, "SELECT ?m ?a ?t ?h WHERE { ?m ex:amount ?a ; ex:title ?t ; ex:homepage ?h }");
+	REQUIRE(!rows.empty());
+	for (const auto &r : rows) {
+		CHECK(r.at("D_M") == "I");
+		CHECK(r.at("D_A") == "Dhttp://www.w3.org/2001/XMLSchema#integer");
+		CHECK(r.at("D_T") == "@en");
+		CHECK(r.at("D_H") == "I");
+	}
+}
+
+TEST_CASE("term tags: a predicate that is an IRI in one map and a literal in another") {
+	auto conn = makeSeededDatabase();
+	auto rows = taggedRows(*conn, "SELECT ?x WHERE { ?m ex:mixed ?x }");
+	std::set<std::string> kinds;
+	for (const auto &r : rows) {
+		kinds.insert(r.at("D_X").substr(0, 1));
+	}
+	CHECK(kinds.count("I") == 1);
+	CHECK((kinds.count("L") + kinds.count("D")) == 1);
+}
+
+TEST_CASE("term tags: unbound OPTIONAL variables have NULL tags") {
+	auto conn = makeSeededDatabase();
+	auto rows = taggedRows(*conn, "SELECT ?m ?t WHERE { ?m ex:amount ?a OPTIONAL { ?m ex:nosuch ?t } }");
+	REQUIRE(!rows.empty());
+	for (const auto &r : rows) {
+		CHECK(r.at("V_T") == kNull);
+		CHECK(r.at("D_T") == kNull);
+		CHECK(r.at("D_M") == "I");
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Reasoning by mapping saturation (Ontology.h): answers include what the class
 // and property hierarchies imply, each resource once.
 // ---------------------------------------------------------------------------

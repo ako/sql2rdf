@@ -65,6 +65,16 @@ struct TranslateOptions {
 	/// strings and anything whose datatype varies per row stay VARCHAR. Only
 	/// SELECT is affected; ASK and CONSTRUCT keep their fixed shapes.
 	bool typedResults = false;
+	/// Return, beside each SELECT output column `v_<var>`, a VARCHAR column
+	/// `d_<var>` holding that term's runtime type tag (see encodeTag in
+	/// TermInfo.h): "I" an IRI, "B" a blank node, "L" a literal of unknown
+	/// datatype, "D<iri>" a typed literal, "@<lang>" a language-tagged one, and
+	/// SQL NULL when the variable is unbound. What a SPARQL results serialiser
+	/// needs to tell `<http://x>` from `"http://x"`. A tag the mapping settles
+	/// is a constant; one it does not is computed per row. A computed SELECT
+	/// expression whose kind cannot be inferred statically gets a NULL tag even
+	/// when bound - read that as a plain literal. Only SELECT is affected.
+	bool termTags = false;
 };
 
 [[nodiscard]] std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMapping &mapping,
