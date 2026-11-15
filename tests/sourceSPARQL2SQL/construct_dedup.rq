@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.com/ns#>
+# The same triple from every solution is one triple: a graph is a set.
+CONSTRUCT { ex:all ex:has ex:Employees . }
+WHERE { ?e a ex:Employee }

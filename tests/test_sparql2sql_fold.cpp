@@ -418,9 +418,9 @@ TEST_CASE("fold: BIND over a variable made optional by a preceding OPTIONAL is i
 	CHECK(result.optionalVars.count("dd") == 1);
 }
 
-TEST_CASE("translateQuery: CONSTRUCT is rejected with a clear TranslationError") {
+TEST_CASE("translateQuery: DESCRIBE is rejected with a clear TranslationError") {
 	Parser parser;
-	auto q = parser.parseFile(SOURCE_SPARQL2SQL_DIR "unsupported_construct.rq");
+	auto q = parser.parseFile(SOURCE_SPARQL2SQL_DIR "unsupported_describe.rq");
 	R2RMLParser mappingParser;
 	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "example_emp_dept.ttl");
 	REQUIRE(mapping.isValid());

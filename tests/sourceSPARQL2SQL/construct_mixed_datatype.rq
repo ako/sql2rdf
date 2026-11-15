@@ -1,0 +1,4 @@
+PREFIX ex: <http://example.com/ns#>
+# ex:mixeddt is xsd:integer in one map and xsd:string in the other.
+CONSTRUCT { ?m ex:v ?x . }
+WHERE { ?m ex:mixeddt ?x }
