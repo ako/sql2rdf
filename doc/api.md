@@ -886,6 +886,31 @@ translates against it, then executes the SQL via `r2rml::DuckDBConnection` and p
 rows; see `-h` for exact stdout/stderr routing. Without a database file, the SQL alone is printed
 and joins use the VARCHAR-cast fallback.
 
+### Vocabulary check (`include/sparql2sql/VocabularyCheck.h`)
+
+A triple pattern whose constant property or class no map can produce never matches, so a misspelled
+term silently gives zero rows - indistinguishable from "no data". `checkVocabulary(query, mapping)`
+throws `TranslationError` listing each such term, with the closest known term of the same kind when
+it looks like a typo:
+
+```
+the query uses property <http://example.com/ns#nmae> (did you mean <http://example.com/ns#name>?),
+which no map in the mapping produces, so a pattern using it can never match
+```
+
+- **Checked:** constant properties in predicate positions and property paths, and constant classes
+  as the object of `a` / `rdf:type`, anywhere in the query: OPTIONAL, UNION, MINUS, GRAPH, FILTER
+  EXISTS / NOT EXISTS, BIND and subqueries. Negated property sets (`!(...)`, which name IRIs to
+  exclude) and SERVICE blocks are not.
+- **Open vocabularies:** a predicate map that is not a constant (`rr:column` / `rr:template`) can
+  produce any predicate, and an `rdf:type` object map that is not a constant any class. The
+  corresponding set is then open and never reports a term - for example when an ontology is mapped
+  as generic (subject, predicate, object) rows.
+- `translateQuery()` does **not** call it: whether an unknown term is an error is the caller's
+  decision (a query shared with another endpoint may legitimately name terms this mapping lacks).
+  `collectVocabulary()` and `findUnknownTerms()` expose the pieces for callers that want to report
+  rather than throw.
+
 ### Supported SPARQL subset / Known limitations
 
 - **Query forms**: only `SELECT` and `ASK`. `CONSTRUCT`/`DESCRIBE` throw `TranslationError`
