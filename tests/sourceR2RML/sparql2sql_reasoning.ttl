@@ -1,0 +1,22 @@
+@prefix rr:  <http://www.w3.org/ns/r2rml#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix ex:  <http://example.com/ns#> .
+
+# Fixture for mapping saturation (Ontology.h). The same employees are typed by
+# two triples maps with different classes, so a query for a common superclass
+# must still return each employee once. Departments are typed through a
+# predicate-object map (rdf:type as rr:predicate) rather than rr:class.
+<#Engineers>
+    rr:logicalTable [ rr:tableName "EMP" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/employee/{EMPNO}" ; rr:class ex:Engineer ] ;
+    rr:predicateObjectMap [ rr:predicate ex:fullName ; rr:objectMap [ rr:column "ENAME" ] ] .
+
+<#Managers>
+    rr:logicalTable [ rr:tableName "EMP" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/employee/{EMPNO}" ; rr:class ex:Manager ] .
+
+<#Departments>
+    rr:logicalTable [ rr:tableName "DEPT" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/department/{DEPTNO}" ] ;
+    rr:predicateObjectMap [ rr:predicate rdf:type ; rr:object ex:Unit ] ;
+    rr:predicateObjectMap [ rr:predicate ex:deptName ; rr:objectMap [ rr:column "DNAME" ] ] .

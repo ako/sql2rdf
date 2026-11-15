@@ -966,6 +966,34 @@ which no map in the mapping produces, so a pattern using it can never match
   `collectVocabulary()` and `findUnknownTerms()` expose the pieces for callers that want to report
   rather than throw.
 
+### Reasoning by mapping saturation (`include/sparql2sql/Ontology.h`)
+
+```cpp
+sparql2sql::Ontology ontology;
+ontology.addTriple(s, p, o);   // true for a recognised axiom
+sparql2sql::SaturationResult r = sparql2sql::saturateMapping(mapping, ontology);
+// then translateQuery(query, mapping, ...) as usual
+```
+
+RDFS-style query answering without changing the query or the translator. This is the
+"T-mapping" approach Ontop uses: before translation, the mapping is expanded so that every map
+that produces a class or property also produces what the ontology says it implies.
+
+- Recognised axioms (between named IRIs): `rdfs:subClassOf`, `rdfs:subPropertyOf`, and
+  `owl:equivalentClass`/`owl:equivalentProperty` (a sub-relation both ways). Hierarchies are
+  closed transitively, and cycles are fine. Other triples, and axioms whose object is a blank node
+  (OWL restrictions), are ignored.
+- Each `rr:class` gains its superclasses. So does an `rr:predicate rdf:type; rr:object <C>`
+  predicate-object map, when `rdf:type` is its only predicate.
+- Each constant `rr:predicate` gains its superproperties.
+- A triple pattern's candidate maps are combined with a duplicate-removing union, so a
+  resource typed by several subclasses appears once in `?x a ex:Super`.
+- Not covered: `rdfs:domain`/`rdfs:range`, inverse and transitive properties, and OWL class
+  expressions. A generic triple map, whose predicate or `rdf:type` object comes from a column,
+  cannot be expanded, so facts it produces are not reasoned over.
+- Run `saturateMapping` before `checkVocabulary`, so inferred classes and properties count as
+  known.
+
 ### Supported SPARQL subset / Known limitations
 
 - **Query forms**: `SELECT`, `ASK` and `CONSTRUCT` (including the short form `CONSTRUCT WHERE`).
