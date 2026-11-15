@@ -263,6 +263,7 @@ set(SPARQL2SQL_SOURCES
   src/sparql2sql/TermMapSql.cpp
   src/sparql2sql/TranslatedPattern.cpp
   src/sparql2sql/TriplePatternTranslator.cpp
+  src/sparql2sql/VocabularyCheck.cpp
   src/sparql2sql/PropertyPathTranslator.cpp
   src/sparql2sql/ExpressionTranslator.cpp
   src/sparql2sql/ValuesFolder.cpp
