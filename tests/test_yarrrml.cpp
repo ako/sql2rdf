@@ -736,6 +736,53 @@ TEST_CASE("YARRRML processDatabase - ~iri suffix on an unresolvable constant for
 	REQUIRE(out.find("<frog:F0009/HTT0000001>") != std::string::npos);
 }
 
+TEST_CASE("YARRRML processDatabase - object map 'type: iri' on a column produces an IRI object") {
+	// Regression: the long form {value: $(COL), type: iri} used to drop the
+	// type key, leaving a literal - so SPARQL joins on the value found nothing.
+	YARRRMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_YARRRML_DIR "object_type_iri.yml");
+	REQUIRE(mapping.isValid());
+	REQUIRE(mapping.parseErrors.empty());
+
+	TriplesMap *tm = findById(mapping, "employee");
+	REQUIRE(tm != nullptr);
+	auto *col = dynamic_cast<ColumnTermMap *>(tm->predicateObjectMaps[0]->objectMaps[0].get());
+	REQUIRE(col != nullptr);
+	REQUIRE(col->columnName == "HOMEPAGE");
+	REQUIRE(col->termType == TermType::IRI);
+
+	MockSQLConnection conn;
+	conn.addResult("EMP", {makeRow({{"EMPNO", StringSQLValue(std::string("7369"))},
+	                                {"HOMEPAGE", StringSQLValue(std::string("http://example.com/~smith"))}})});
+	std::string out = runProcessDatabase(mapping, conn);
+	REQUIRE(out.find("<http://example.com/~smith>") != std::string::npos);
+}
+
+TEST_CASE("YARRRML processDatabase - object map 'type: literal' on a template produces a literal object") {
+	YARRRMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_YARRRML_DIR "object_type_literal.yml");
+	REQUIRE(mapping.isValid());
+	REQUIRE(mapping.parseErrors.empty());
+
+	TriplesMap *tm = findById(mapping, "employee");
+	REQUIRE(tm != nullptr);
+	auto *tpl = dynamic_cast<TemplateTermMap *>(tm->predicateObjectMaps[0]->objectMaps[0].get());
+	REQUIRE(tpl != nullptr);
+	REQUIRE(tpl->termType == TermType::Literal);
+
+	MockSQLConnection conn;
+	conn.addResult("EMP", {makeRow({{"EMPNO", StringSQLValue(std::string("7369"))},
+	                                {"CODE", StringSQLValue(std::string("A1"))}})});
+	std::string out = runProcessDatabase(mapping, conn);
+	REQUIRE(out.find("\"http://example.com/code/A1\"") != std::string::npos);
+}
+
+TEST_CASE("YARRRML parse - unknown object map 'type' is reported and the object skipped") {
+	YARRRMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_YARRRML_DIR "object_type_unknown.yml");
+	REQUIRE(hasError(mapping, "unknown object type 'url'"));
+}
+
 TEST_CASE("YARRRML processDatabase - constant literal object produces a plain literal") {
 	YARRRMLParser parser;
 	R2RMLMapping mapping = parser.parse(SOURCE_YARRRML_DIR "constant_literal.yml");

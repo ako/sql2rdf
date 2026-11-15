@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.com/ns#>
+SELECT (SUM(?a) AS ?total) (MIN(?a) AS ?lo) (MAX(?a) AS ?hi)
+WHERE {
+  ?p ex:paid ?a .
+  FILTER(?a < 1)
+}

@@ -1095,6 +1095,10 @@ and joins use the VARCHAR-cast fallback.
     applies to `SUM()`, and to `ABS()`/`CEIL()`/`FLOOR()`/`ROUND()`. Division, and any operand of
     unknown or non-integral type, still goes through `DOUBLE`; integrality known only at run time is
     not exploited, so such an expression renders as a double.
+  - `SUM()`, `MIN()` and `MAX()` over a statically `xsd:decimal` argument stay fixed-point: they
+    aggregate `TRY_CAST(... AS DECIMAL(38,18))` and render the result in canonical decimal form
+    (trailing fractional zeros and a trailing point removed), so `0.10 + 0.20` renders `"0.3"`
+    rather than the `DOUBLE` sum `"0.30000000000000004"`. `AVG()` still goes through `DOUBLE`.
   - `ORDER BY` sorts **in the key's static type** when it is known numeric or temporal, and
     lexicographically otherwise. When the key's dimension varies per row the single key expands into
     SPARQL §15.1's own layered order: term kind first (unbound < blank node < IRI < literal), then

@@ -1,0 +1,13 @@
+@prefix rr:  <http://www.w3.org/ns/r2rml#> .
+@prefix ex:  <http://example.com/ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Money-style amounts: a DECIMAL(10,2) column declared xsd:decimal. Backs the
+# fixed-point SUM/MIN/MAX checks in tests/duckdb/.
+<#Payments>
+    rr:logicalTable [ rr:tableName "PAYMENTS" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/payment/{ID}" ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:paid ;
+        rr:objectMap [ rr:column "AMOUNT" ; rr:datatype xsd:decimal ]
+    ] .

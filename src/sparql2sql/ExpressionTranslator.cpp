@@ -744,6 +744,11 @@ std::string translateAggregate(const AggregateExpr &agg, const TranslatedPattern
 		if (argInfo.isIntegral()) {
 			return "CAST(SUM(" + distinctPrefix + dialect.tryCastToBigInt(arg) + ") AS VARCHAR)";
 		}
+		// xsd:decimal stays fixed-point: a DOUBLE sum turns money totals such as
+		// 0.10 + 0.20 into "0.30000000000000004".
+		if (argInfo.datatypeIri == xsd::kDecimal) {
+			return dialect.decimalToLexical("SUM(" + distinctPrefix + dialect.tryCastToDecimal(arg) + ")");
+		}
 		return "CAST(SUM(" + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR)";
 	case AggregateKind::Avg:
 		return "CAST(AVG(" + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR)";
@@ -761,6 +766,9 @@ std::string translateAggregate(const AggregateExpr &agg, const TranslatedPattern
 		const std::string fn = (agg.aggKind == AggregateKind::Min) ? "MIN(" : "MAX(";
 		if (argInfo.isIntegral()) {
 			return "CAST(" + fn + distinctPrefix + dialect.tryCastToBigInt(arg) + ") AS VARCHAR)";
+		}
+		if (argInfo.datatypeIri == xsd::kDecimal) {
+			return dialect.decimalToLexical(fn + distinctPrefix + dialect.tryCastToDecimal(arg) + ")");
 		}
 		if (argInfo.isNumeric()) {
 			return "CAST(" + fn + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR)";
