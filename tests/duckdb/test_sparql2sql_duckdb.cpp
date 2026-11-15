@@ -36,6 +36,7 @@
 #include "r2rml/SQLValue.h"
 #include "sparql-parser/Parser.h"
 #include "sparql2sql/DuckDbDialect.h"
+#include "sparql2sql/Ontology.h"
 #include "sparql2sql/TermInfo.h"
 #include "sparql2sql/TranslationError.h"
 #include "sparql2sql/Translator.h"
@@ -2244,4 +2245,79 @@ TEST_CASE("typed results: off by default, so every column stays VARCHAR") {
 	for (const auto &t : resultTypes(*conn, typedSql(kTypedTermsQuery, mapping, nullptr, false))) {
 		CHECK(t.second == "VARCHAR");
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning by mapping saturation (Ontology.h): answers include what the class
+// and property hierarchies imply, each resource once.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+sparql2sql::Ontology reasoningOntology() {
+	const std::string ex = "http://example.com/ns#";
+	const std::string sub = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+	const std::string subProp = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
+	sparql2sql::Ontology o;
+	o.addTriple(ex + "Engineer", sub, ex + "Staff");
+	o.addTriple(ex + "Manager", sub, ex + "Staff");
+	o.addTriple(ex + "Staff", sub, ex + "Person");
+	o.addTriple(ex + "Unit", "http://www.w3.org/2002/07/owl#equivalentClass", ex + "Org");
+	o.addTriple(ex + "fullName", subProp, ex + "label");
+	o.addTriple(ex + "deptName", subProp, ex + "label");
+	o.addTriple(ex + "label", subProp, "http://www.w3.org/2000/01/rdf-schema#label");
+	return o;
+}
+
+std::vector<Row> runReasoning(DuckDBConnection &conn, const std::string &body, bool withOntology = true) {
+	R2RMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_R2RML_DIR "sparql2sql_reasoning.ttl");
+	if (withOntology) {
+		sparql2sql::saturateMapping(mapping, reasoningOntology());
+	}
+	return runWithCatalog(
+	    conn, "PREFIX ex: <http://example.com/ns#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n" + body,
+	    mapping, nullptr);
+}
+
+} // namespace
+
+TEST_CASE("reasoning: a superclass query returns each subclass member once") {
+	auto conn = makeSeededDatabase();
+	// Both employees are an ex:Engineer and an ex:Manager; ex:Person is two levels up.
+	auto rows = runReasoning(*conn, "SELECT ?x WHERE { ?x a ex:Person }");
+	REQUIRE(rows.size() == 2);
+	CHECK(containsRow(rows, {{"V_X", "http://data.example.com/employee/7369"}}));
+	CHECK(containsRow(rows, {{"V_X", "http://data.example.com/employee/7400"}}));
+	CHECK(runReasoning(*conn, "SELECT ?x WHERE { ?x a ex:Person }", false).empty());
+	// Asserted classes still answer as before.
+	CHECK(runReasoning(*conn, "SELECT ?x WHERE { ?x a ex:Engineer }").size() == 2);
+}
+
+TEST_CASE("reasoning: superproperties reach every subproperty, through a chain") {
+	auto conn = makeSeededDatabase();
+	auto rows = runReasoning(*conn, "SELECT ?x ?l WHERE { ?x rdfs:label ?l }");
+	REQUIRE(rows.size() == 4);
+	CHECK(containsRow(rows, {{"V_X", "http://data.example.com/employee/7369"}, {"V_L", "SMITH"}}));
+	CHECK(containsRow(rows, {{"V_X", "http://data.example.com/department/20"}, {"V_L", "SALES"}}));
+	CHECK(runReasoning(*conn, "SELECT ?x ?l WHERE { ?x ex:label ?l }").size() == 4);
+}
+
+TEST_CASE("reasoning: an equivalent class and an rdf:type predicate-object map") {
+	auto conn = makeSeededDatabase();
+	auto rows = runReasoning(*conn, "SELECT ?d ?n WHERE { ?d a ex:Org ; ex:deptName ?n }");
+	REQUIRE(rows.size() == 2);
+	CHECK(containsRow(rows, {{"V_D", "http://data.example.com/department/10"}, {"V_N", "APPSERVER"}}));
+}
+
+TEST_CASE("reasoning: all types of a resource, asserted and inferred") {
+	auto conn = makeSeededDatabase();
+	auto rows = runReasoning(*conn, "SELECT ?t WHERE { <http://data.example.com/employee/7369> a ?t }");
+	std::set<std::string> types;
+	for (const auto &r : rows) {
+		types.insert(r.at("V_T"));
+	}
+	const std::string ex = "http://example.com/ns#";
+	CHECK(types == std::set<std::string> {ex + "Engineer", ex + "Manager", ex + "Staff", ex + "Person"});
+	CHECK(rows.size() == 4);
 }
