@@ -315,6 +315,16 @@ public:
 		return tagVars_.count(varName) != 0;
 	}
 
+	/// Whether the top-level SELECT must carry a tag for every output
+	/// variable (TranslateOptions::termTags).
+	void setResultTags(bool on) {
+		resultTags_ = on;
+	}
+
+	bool resultTags() const {
+		return resultTags_;
+	}
+
 	/// The uncast, numerically typed base column behind variable `varName` when
 	/// it is referenced through `alias`, or "" when there is none. Only set
 	/// while a FILTER conjunct is being folded into the single block that owns
@@ -453,6 +463,7 @@ private:
 	std::map<std::string, std::string> viewCteNames_;
 	std::vector<CteDef> viewCtes_;
 	bool prettyPrint_;
+	bool resultTags_ = false;
 	std::size_t subqueryDepth_ = 0;
 	GraphConstraint activeGraph_;
 	ActiveDataset dataset_;

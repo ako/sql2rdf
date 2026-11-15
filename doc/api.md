@@ -564,6 +564,7 @@ std::string sparql2sql::translateQuery(const sparql::ast::Query& query,
 struct sparql2sql::TranslateOptions {
     bool prettyPrint = false;   // lay the SQL out for reading
     bool typedResults = false;  // SELECT columns as native SQL values (below)
+    bool termTags = false;      // a d_<var> term tag beside each SELECT column (below)
 };
 std::string sparql2sql::translateQuery(const sparql::ast::Query& query,
                                         const r2rml::R2RMLMapping& mapping,
@@ -599,6 +600,25 @@ language-tagged strings, other datatypes, and any column whose kind or datatype 
 Aggregates are typed by their result datatype, so `COUNT` and an integral `SUM` give `BIGINT`. The
 cast is a `TRY_CAST`, so a value that does not fit its declared datatype becomes NULL instead of
 failing the query. ASK and CONSTRUCT are not affected.
+
+**Term tags.** A SELECT column holds only the term's lexical form, so `<http://x>` and `"http://x"`
+look the same. With `TranslateOptions::termTags`, each output column `v_<var>` is followed by a
+VARCHAR column `d_<var>` with the term's tag, in `encodeTag`'s encoding:
+
+| Tag | Term |
+|---|---|
+| `I` | IRI |
+| `B` | blank node |
+| `D<iri>` | literal with datatype `<iri>` |
+| `@<lang>` | language-tagged literal |
+| `L` | literal whose datatype the mapping does not determine (a plain literal) |
+| NULL | unbound |
+
+A tag the mapping settles is a constant, guarded so it is NULL when the value is; one that varies per
+row comes from the runtime tag column the translator already carries. A computed SELECT expression
+whose kind cannot be inferred statically gets a NULL tag even when bound; read it as a plain literal.
+This is what a SPARQL results serialiser (JSON, XML) needs. It combines with `typedResults` and has no
+effect on ASK or CONSTRUCT, whose shapes already say what each column is.
 
 `translateQuery()` applies `prependCtes()` to its own result, so ordinary callers never need it. It
 matters for the other direction: code driving `translateTriplePattern()`/`renderRelation()` itself

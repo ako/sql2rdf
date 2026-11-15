@@ -397,6 +397,25 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 	opts.ctx = &ctx;
 	rootNode = optimize(std::move(rootNode), opts);
 	markExpressionTagNeeds(*rootNode, &query, ctx);
+	// Term tags on the result: every bare output variable needs its tag. The
+	// projection below still skips the ones the mapping settles; those become
+	// constants in addResultTags.
+	const bool resultTags = !nested && !construct && ctx.resultTags();
+	if (resultTags) {
+		if (query.selectStar) {
+			for (const auto &c : rootNode->schema()) {
+				if (!ctx.isInternal(c.var)) {
+					ctx.markNeedsTag(c.var);
+				}
+			}
+		} else {
+			for (const auto &item : query.selectItems) {
+				if (!item.expr) {
+					ctx.markNeedsTag(item.var->name);
+				}
+			}
+		}
+	}
 	TranslatedPattern source;
 	{
 		TranslationContext::SubqueryDepthGuard depthGuard(ctx);
@@ -432,7 +451,7 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 	// Both are gated on the dimension not being statically determined, so an
 	// ordinary query's result columns stay exactly the variables it projected.
 	const bool dedup = query.distinct || query.reduced;
-	const bool wantTagCols = nested || dedup || construct;
+	const bool wantTagCols = nested || dedup || construct || resultTags;
 	std::set<std::string> tagCols;
 	std::vector<std::string> selectCols = groupBy.selectListPrefixCols;
 	if (selectStar) {
@@ -889,6 +908,45 @@ std::string typeSelectResult(const sparql::ast::Query &query, const TranslatedPa
 	return dialect.replaceColumns(sql, alias, replacements);
 }
 
+// Term tags: give a finished SELECT one `d_<var>` column per output variable.
+// The ones translateQueryPattern projected pass through; the rest are the
+// constant the mapping settles, or NULL when nothing does.
+std::string addResultTags(const sparql::ast::Query &query, const TranslatedPattern &result, const std::string &sql,
+                          TranslationContext &ctx) {
+	const SqlDialect &dialect = ctx.dialect();
+	std::vector<std::string> outputVars;
+	if (query.selectStar) {
+		for (const auto &v : result.allVars()) {
+			outputVars.push_back(v);
+		}
+	} else {
+		for (const auto &item : query.selectItems) {
+			outputVars.push_back(item.var->name);
+		}
+	}
+	const std::string alias = ctx.nextAlias();
+	std::vector<std::string> cols;
+	for (const auto &v : outputVars) {
+		const std::string value = alias + "." + mangleVar(v, dialect);
+		cols.push_back(value + " AS " + mangleVar(v, dialect));
+		std::string tag;
+		if (result.providedTagVars.count(v) != 0) {
+			tag = alias + "." + mangleVarTag(v, dialect);
+		} else {
+			const std::string constant = tagLiteral(result.termInfoOf(v), dialect);
+			// NULL iff the value is: a constant tag must not mark an unbound
+			// variable as bound.
+			tag = constant.empty() ? std::string("CAST(NULL AS VARCHAR)")
+			                       : "CASE WHEN " + value + " IS NULL THEN NULL ELSE " + constant + " END";
+		}
+		cols.push_back(tag + " AS " + mangleVarTag(v, dialect));
+	}
+	if (cols.empty()) {
+		return sql;
+	}
+	return "SELECT" + joinColumnList(cols, ctx) + ctx.clauseSep() + "FROM (" + sql + ") AS " + alias;
+}
+
 } // namespace
 
 std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMapping &mapping,
@@ -974,11 +1032,16 @@ std::string translateQuery(const sparql::ast::Query &query, const r2rml::R2RMLMa
 		    "query form not supported (only SELECT, ASK and CONSTRUCT are implemented; DESCRIBE is not)");
 	}
 
+	ctx.setResultTags(options.termTags);
 	TranslatedPattern result = translateQueryPattern(query, ctx);
+	std::string sql = result.sql;
 	if (options.typedResults) {
-		return prependCtes(ctx, typeSelectResult(query, result, result.sql, ctx));
+		sql = typeSelectResult(query, result, sql, ctx);
 	}
-	return prependCtes(ctx, result.sql);
+	if (options.termTags) {
+		sql = addResultTags(query, result, sql, ctx);
+	}
+	return prependCtes(ctx, sql);
 }
 
 } // namespace sparql2sql
