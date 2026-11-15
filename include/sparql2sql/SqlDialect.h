@@ -74,6 +74,14 @@ public:
 	/// (rather than an error) for non-numeric input.
 	virtual std::string tryCastToDecimal(const std::string &expr) const = 0;
 
+	/// Render a fixed-point decimal expression (as produced by
+	/// tryCastToDecimal(), or an aggregate over one) as the canonical
+	/// xsd:decimal lexical form: no trailing fractional zeros and no trailing
+	/// decimal point, so 0.300000000000000000 renders "0.3" and 5.000 renders
+	/// "5". Used where a decimal must stay exact (SUM/MIN/MAX over
+	/// xsd:decimal) instead of round-tripping through DOUBLE.
+	virtual std::string decimalToLexical(const std::string &decimalExpr) const = 0;
+
 	/// Render a (possibly negated) regular-expression match test.
 	virtual std::string regexMatch(const std::string &text, const std::string &pattern, const std::string &flags,
 	                               bool negated) const = 0;

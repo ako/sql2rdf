@@ -26,6 +26,8 @@
 #include <serd/serd.h>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -250,7 +252,9 @@ enum class VKind { Column, Template, ConstIri, ConstLit };
 struct VSpec {
 	VKind kind {VKind::ConstLit};
 	std::string text;
-	bool forceIri {false}; // "$(COL)~iri" / mixed template with ~iri was given.
+	bool forceIri {false};       // "$(COL)~iri" / mixed template with ~iri / `type: iri` was given.
+	bool forceLiteral {false};   // `type: literal` was given (matters for templates, which default to IRIs).
+	bool forceBlankNode {false}; // `type: blanknode` was given (column or template values only).
 };
 
 /// Classify a raw YARRRML value string into a Column / Template / constant
@@ -410,15 +414,14 @@ rdf::Term emitValueSpecAsMap(r2rml::TripleCollector &collector, BlankNodeMinter 
 	rdf::Term node = blanks.next();
 	switch (vs.kind) {
 	case VKind::Column:
-		emitLiteralTriple(collector, node, RR_COLUMN, vs.text);
-		if (vs.forceIri) {
-			emitUriTriple(collector, node, RR_TERM_TYPE, rdf::Term::iri(RR_IRI_TERM_TYPE));
-		}
-		break;
 	case VKind::Template:
-		emitLiteralTriple(collector, node, RR_TEMPLATE, vs.text);
+		emitLiteralTriple(collector, node, vs.kind == VKind::Column ? RR_COLUMN : RR_TEMPLATE, vs.text);
 		if (vs.forceIri) {
 			emitUriTriple(collector, node, RR_TERM_TYPE, rdf::Term::iri(RR_IRI_TERM_TYPE));
+		} else if (vs.forceBlankNode) {
+			emitUriTriple(collector, node, RR_TERM_TYPE, rdf::Term::iri(RR_BLANKNODE_TERM_TYPE));
+		} else if (vs.forceLiteral) {
+			emitUriTriple(collector, node, RR_TERM_TYPE, rdf::Term::iri(RR_LITERAL_TERM_TYPE));
 		}
 		break;
 	case VKind::ConstIri:
@@ -469,6 +472,49 @@ PredicateResult buildPredicateResult(r2rml::TripleCollector &collector, BlankNod
 	default:
 		return PredicateResult {true, resolveIri(vs.text, prefixes), rdf::Term()};
 	}
+}
+
+/// Apply an object map's YARRRML `type:` key (`iri`, `literal` or `blanknode`)
+/// to `vs`. Without this, the key was silently dropped: a plain `$(COL)` value
+/// stayed a literal even with `type: iri`, so joins on it found nothing.
+/// Returns false (after recording a non-fatal error) when the entry has to be
+/// skipped: an unknown type, or a blank node asked of a constant, which R2RML
+/// cannot express.
+bool applyObjectTermType(r2rml::TripleCollector &collector, const YAML::Node &typeNode, VSpec &vs,
+                         const std::string &mappingName) {
+	if (!typeNode) {
+		return true;
+	}
+	std::string type = typeNode.IsScalar() ? typeNode.as<std::string>() : std::string();
+	std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) { return std::tolower(c); });
+	if (type == "iri") {
+		vs.forceIri = true;
+		if (vs.kind == VKind::ConstLit) {
+			vs.kind = VKind::ConstIri;
+		}
+		return true;
+	}
+	if (type == "literal") {
+		vs.forceIri = false;
+		vs.forceLiteral = true;
+		if (vs.kind == VKind::ConstIri) {
+			vs.kind = VKind::ConstLit;
+		}
+		return true;
+	}
+	if (type == "blanknode" || type == "blank") {
+		if (vs.kind == VKind::ConstIri || vs.kind == VKind::ConstLit) {
+			collector.addError("YARRRML parser: mapping '" + mappingName +
+			                   "': type 'blanknode' needs a $(...) column or template value, object skipped");
+			return false;
+		}
+		vs.forceIri = false;
+		vs.forceBlankNode = true;
+		return true;
+	}
+	collector.addError("YARRRML parser: mapping '" + mappingName + "': unknown object type '" + type +
+	                   "' (expected iri, literal or blanknode), object skipped");
+	return false;
 }
 
 /// Translate one object-list entry (a plain scalar, a [value, dtOrLang]
@@ -553,6 +599,9 @@ rdf::Term emitObjectNode(r2rml::TripleCollector &collector, BlankNodeMinter &bla
 				extra.language = langNode.as<std::string>();
 			}
 			VSpec vs = classifyValue(valNode.as<std::string>(), true, true, prefixes);
+			if (!applyObjectTermType(collector, objNode["type"], vs, mappingName)) {
+				return rdf::Term();
+			}
 			return emitValueSpecAsMap(collector, blanks, vs, prefixes, extra);
 		}
 

@@ -108,6 +108,14 @@ std::string DuckDbDialect::tryCastToDecimal(const std::string &expr) const {
 	return "TRY_CAST(" + expr + " AS DECIMAL(38,18))";
 }
 
+std::string DuckDbDialect::decimalToLexical(const std::string &decimalExpr) const {
+	// Trailing zeros only ever occur after a decimal point in a DECIMAL's text,
+	// so the pattern cannot touch an integer part: "0.300" -> "0.3" (first
+	// branch keeps the significant fraction), "5.000" -> "5" (second branch
+	// drops the point too), "100" -> "100" (no point, no match).
+	return "regexp_replace(CAST(" + decimalExpr + " AS VARCHAR), '(\\.[0-9]*[1-9])0+$|\\.0+$', '\\1')";
+}
+
 std::string DuckDbDialect::regexMatch(const std::string &text, const std::string &pattern, const std::string &flags,
                                       bool negated) const {
 	std::string call = "regexp_matches(" + text + ", " + pattern;

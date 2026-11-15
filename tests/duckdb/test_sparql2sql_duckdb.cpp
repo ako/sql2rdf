@@ -116,6 +116,12 @@ std::unique_ptr<DuckDBConnection> makeSeededDatabase() {
 	              "(1, 9,   2.50,  '2019-12-31T23:59:59', 'alpha', 'http://ex.org/a', 2), "
 	              "(2, 100, 10.00, '2020-06-01T12:00:00', 'beta',  'http://ex.org/b', 1)");
 
+	// Money-style DECIMAL fixture backing sparql2sql_decimal.ttl. 0.10 + 0.20 is
+	// the classic value whose DOUBLE sum is 0.30000000000000004, so an
+	// aggregate that silently goes through floating point is observable.
+	conn->execute("CREATE TABLE PAYMENTS (ID INTEGER, AMOUNT DECIMAL(10,2))");
+	conn->execute("INSERT INTO PAYMENTS VALUES (1, 0.10), (2, 0.20), (3, 5.00)");
+
 	// Blank-node-subject fixture, and the literal-valued arm of the four
 	// multi-arm predicates (ex:mixed / ex:desc / ex:mixedtag / ex:mixeddt).
 	//
@@ -422,6 +428,15 @@ TEST_CASE("emp_dept_aggregate.rq: COUNT per department") {
 	// Only DEPT 10 has an employee with a non-null department (SMITH).
 	REQUIRE(rows.size() == 1);
 	CHECK(containsRow(rows, {{"V_D", "http://data.example.com/department/10"}, {"V_CNT", "1"}}));
+}
+
+TEST_CASE("decimal_aggregates.rq: SUM/MIN/MAX over xsd:decimal are exact and canonical") {
+	auto conn = makeSeededDatabase();
+	auto rows = translateAndRun(*conn, "decimal_aggregates.rq", "sparql2sql_decimal.ttl");
+	REQUIRE(rows.size() == 1);
+	// A DOUBLE sum would give "0.30000000000000004"; trailing zeros of the
+	// DECIMAL(38,18) working type are trimmed to the canonical lexical form.
+	CHECK(containsRow(rows, {{"V_TOTAL", "0.3"}, {"V_LO", "0.1"}, {"V_HI", "0.2"}}));
 }
 
 TEST_CASE("emp_dept_name_count.rq: COUNT(*) over a multi-candidate predicate doesn't double-count the "

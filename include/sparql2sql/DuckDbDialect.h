@@ -22,6 +22,7 @@ public:
 	std::string tryCastToBoolean(const std::string &expr) const override;
 	std::string tryCastToDate(const std::string &expr) const override;
 	std::string tryCastToDecimal(const std::string &expr) const override;
+	std::string decimalToLexical(const std::string &decimalExpr) const override;
 	std::string regexMatch(const std::string &text, const std::string &pattern, const std::string &flags,
 	                       bool negated) const override;
 	std::string stringAgg(const std::string &expr, const std::string &separatorLiteral, bool distinct) const override;

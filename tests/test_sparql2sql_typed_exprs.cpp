@@ -232,6 +232,25 @@ TEST_CASE("SUM: an integral argument keeps an integral lexical form", "[sparql2s
 	CHECK(contains(sql, "AS BIGINT"));
 }
 
+TEST_CASE("SUM: an xsd:decimal argument stays fixed-point", "[sparql2sql]") {
+	// A DOUBLE sum turns money totals such as 0.10 + 0.20 into
+	// "0.30000000000000004"; the decimal path keeps them exact.
+	const std::string sql = translate("SELECT (SUM(?p) AS ?s) WHERE { ?m ex:price ?p }");
+	CHECK(contains(sql, "SUM(TRY_CAST("));
+	CHECK(contains(sql, "AS DECIMAL(38,18)"));
+	CHECK_FALSE(contains(sql, "AS DOUBLE"));
+	CHECK(contains(sql, "regexp_replace("));
+}
+
+TEST_CASE("MIN/MAX: an xsd:decimal argument stays fixed-point", "[sparql2sql]") {
+	for (const char *fn : {"MIN", "MAX"}) {
+		const std::string sql = translate(std::string("SELECT (") + fn + "(?p) AS ?s) WHERE { ?m ex:price ?p }");
+		CHECK(contains(sql, std::string(fn) + "(TRY_CAST("));
+		CHECK(contains(sql, "AS DECIMAL(38,18)"));
+		CHECK_FALSE(contains(sql, "AS DOUBLE"));
+	}
+}
+
 TEST_CASE("AVG and COUNT are unaffected by the argument's datatype", "[sparql2sql]") {
 	// AVG is always DOUBLE (an average of integers is not an integer), and
 	// COUNT never looks at its argument's type at all.
