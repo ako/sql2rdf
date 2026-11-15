@@ -31,6 +31,7 @@
 #include "r2rml/R2RMLParser.h"
 #include "sparql-parser/Parser.h"
 #include "sparql2sql/DuckDbDialect.h"
+#include "sparql2sql/TypeCatalog.h"
 #include "sparql2sql/Translator.h"
 
 using r2rml::R2RMLMapping;
@@ -186,4 +187,49 @@ TEST_CASE("pushdown: FILTER over MINUS is pushed onto the anti-join left side", 
 	// then distributed into both of its arms.
 	CHECK(sql.find("'SMITH'") < sql.find("NOT EXISTS"));
 	CHECK(countFilterInstances(sql, "'SMITH'") >= 2);
+}
+
+namespace {
+
+std::string translateNative(const std::string &body, bool withCatalog) {
+	Parser parser;
+	auto q = parser.parseString("PREFIX ex: <http://example.com/ns#>\nSELECT * WHERE { " + body + " }");
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_native_pushdown.ttl");
+	sparql2sql::TypeCatalog cat;
+	cat.columnTypes["MEASURES"]["ID"] = "INTEGER";
+	cat.columnTypes["MEASURES"]["REF"] = "INTEGER";
+	cat.columnTypes["MEASURES"]["AMOUNT"] = "INTEGER";
+	cat.columnTypes["MEASURES"]["PRICE"] = "DOUBLE";
+	cat.columnTypes["PAYMENTS"]["ID"] = "INTEGER";
+	cat.columnTypes["PAYMENTS"]["AMOUNT"] = "DECIMAL(10,2)";
+	DuckDbDialect dialect;
+	return translateQuery(*q, mapping, dialect, withCatalog ? &cat : nullptr);
+}
+
+} // namespace
+
+TEST_CASE("native pushdown: a constant IRI compares the integer key column directly", "[sparql2sql]") {
+	const std::string body = "?m ex:ref <http://data.example.com/measure/1>";
+	CHECK(translateNative(body, true).find("\"REF\" = 1") != std::string::npos);
+	// No catalog: the column type is unknown, so the lexical comparison stays.
+	CHECK(translateNative(body, false).find("CAST(t") != std::string::npos);
+	CHECK(translateNative(body, false).find("= '1'") != std::string::npos);
+	// "01" is not how any integer renders, so the pattern matches nothing.
+	CHECK(translateNative("?m ex:ref <http://data.example.com/measure/01>", true).find("FALSE") != std::string::npos);
+}
+
+TEST_CASE("native pushdown: a folded numeric FILTER compares the typed column directly", "[sparql2sql]") {
+	const std::string native = translateNative("?m ex:amount ?a FILTER(?a > 50)", true);
+	CHECK(native.find("\"AMOUNT\" > 50)") != std::string::npos);
+	CHECK(native.find("TRY_CAST") == std::string::npos);
+	CHECK(translateNative("?m ex:paid ?x FILTER(?x <= 0.25)", true).find("\"AMOUNT\" <= 0.25)") != std::string::npos);
+	// Without a catalog nothing changes.
+	CHECK(translateNative("?m ex:amount ?a FILTER(?a > 50)", false).find("TRY_CAST") != std::string::npos);
+	// Arithmetic is not a bare column reference, so it keeps the DOUBLE form.
+	CHECK(translateNative("?m ex:amount ?a FILTER(?a + 1 > 50)", true).find("TRY_CAST") != std::string::npos);
+	// A FILTER that stays above an OPTIONAL is not folded into the owning block,
+	// so the column ref is not in scope there and must not be used.
+	const std::string optional = translateNative("?m ex:price ?p OPTIONAL { ?m ex:amount ?a } FILTER(?a > 50)", true);
+	CHECK(optional.find("TRY_CAST(") != std::string::npos);
 }

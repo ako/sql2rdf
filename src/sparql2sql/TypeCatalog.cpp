@@ -155,6 +155,20 @@ bool TypeCatalog::isStringType(const std::string &table, const std::string &colu
 	return categoryOf(normalizeType(type)) == TypeCategory::String;
 }
 
+bool TypeCatalog::isIntegerType(const std::string &table, const std::string &column) const {
+	std::string type = typeOf(table, column);
+	return !type.empty() && categoryOf(normalizeType(type)) == TypeCategory::Integer;
+}
+
+bool TypeCatalog::isNumericType(const std::string &table, const std::string &column) const {
+	std::string type = typeOf(table, column);
+	if (type.empty()) {
+		return false;
+	}
+	const TypeCategory category = categoryOf(normalizeType(type));
+	return category == TypeCategory::Integer || category == TypeCategory::Float;
+}
+
 std::string naturalXsdDatatype(const std::string &sqlTypeName) {
 	// R2RML Section 10.2's table, plus the spellings DuckDB and common
 	// information_schema implementations actually report. Two entries look like

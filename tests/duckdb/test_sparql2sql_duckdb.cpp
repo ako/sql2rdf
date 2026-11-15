@@ -1980,3 +1980,55 @@ TEST_CASE("DuckDBConnection::execute: a VARCHAR with an embedded NUL byte round-
 	CHECK(value->asString().size() == 6);
 	CHECK_FALSE(rs->next());
 }
+
+namespace {
+
+std::string translateWithCatalog(const std::string &queryText, const R2RMLMapping &mapping,
+                                 const sparql2sql::TypeCatalog *catalog) {
+	Parser parser;
+	auto query = parser.parseString(queryText);
+	DuckDbDialect dialect;
+	return translateQuery(*query, mapping, dialect, catalog);
+}
+
+} // namespace
+
+TEST_CASE("native pushdown: constant IRIs and numeric FILTERs compare typed columns directly") {
+	auto conn = makeSeededDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_native_pushdown.ttl");
+	REQUIRE(mapping.isValid());
+	sparql2sql::TypeCatalog cat;
+	sql2rdf::loadTypeCatalog(*conn, &mapping, cat);
+
+	struct Case {
+		const char *body;
+		const char *nativeSql; // must appear in the SQL translated with the catalog
+		std::size_t rows;
+	};
+	const std::vector<Case> cases = {
+	    // MEASURES rows: (ID 1, AMOUNT 9, PRICE 2.5, REF 2), (ID 2, AMOUNT 100, PRICE 10.0, REF 1)
+	    {"?m ex:ref <http://data.example.com/measure/1>", "\"REF\" = 1", 1},
+	    // Not a canonical integer, so no row's REF can render as "01"
+	    {"?m ex:ref <http://data.example.com/measure/01>", "FALSE", 0},
+	    {"?m ex:amount ?a FILTER(?a > 50)", "\"AMOUNT\" > 50", 1},
+	    {"?m ex:amount ?a FILTER(50 < ?a)", "50 < t", 1},
+	    {"?m ex:amount ?a FILTER(?a = 9)", "\"AMOUNT\" = 9", 1},
+	    {"?m ex:price ?p FILTER(?p >= 2.5)", "\"PRICE\" >= 2.5", 2},
+	    {"?m ex:paid ?x FILTER(?x = 0.1)", "\"AMOUNT\" = 0.1", 1},
+	    {"?m ex:paid ?x FILTER(?x > 0.15)", "\"AMOUNT\" > 0.15", 2},
+	};
+	for (const auto &c : cases) {
+		const std::string query =
+		    std::string("PREFIX ex: <http://example.com/ns#>\nSELECT ?m WHERE { ") + c.body + " }";
+		INFO("query: " << c.body);
+		const std::string nativeSql = translateWithCatalog(query, mapping, &cat);
+		INFO("SQL with catalog: " << nativeSql);
+		CHECK(nativeSql.find(c.nativeSql) != std::string::npos);
+		CHECK(nativeSql.find("TRY_CAST") == std::string::npos);
+		auto withCatalog = runWithCatalog(*conn, query, mapping, &cat);
+		auto withoutCatalog = runWithCatalog(*conn, query, mapping, nullptr);
+		CHECK(withCatalog.size() == c.rows);
+		CHECK(sorted(withCatalog) == sorted(withoutCatalog));
+	}
+}

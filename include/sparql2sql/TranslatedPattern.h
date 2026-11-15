@@ -308,6 +308,42 @@ public:
 		return tagVars_.count(varName) != 0;
 	}
 
+	/// The uncast, numerically typed base column behind variable `varName` when
+	/// it is referenced through `alias`, or "" when there is none. Only set
+	/// while a FILTER conjunct is being folded into the single block that owns
+	/// that column (NativeNumericGuard), because only there is the column ref
+	/// in scope. A numeric comparison uses it in place of
+	/// TRY_CAST(<lexical form> AS DOUBLE), so the predicate stays a plain column
+	/// comparison that the engine can push into a scan.
+	std::string nativeNumericRef(const std::string &alias, const std::string &varName) const {
+		if (alias != nativeNumericAlias_) {
+			return std::string();
+		}
+		auto it = nativeNumericRefs_.find(varName);
+		return it == nativeNumericRefs_.end() ? std::string() : it->second;
+	}
+
+	class NativeNumericGuard {
+	public:
+		NativeNumericGuard(TranslationContext &ctx, std::string alias, std::map<std::string, std::string> refs)
+		    : ctx_(ctx), savedAlias_(std::move(ctx.nativeNumericAlias_)),
+		      savedRefs_(std::move(ctx.nativeNumericRefs_)) {
+			ctx_.nativeNumericAlias_ = std::move(alias);
+			ctx_.nativeNumericRefs_ = std::move(refs);
+		}
+		~NativeNumericGuard() {
+			ctx_.nativeNumericAlias_ = std::move(savedAlias_);
+			ctx_.nativeNumericRefs_ = std::move(savedRefs_);
+		}
+		NativeNumericGuard(const NativeNumericGuard &) = delete;
+		NativeNumericGuard &operator=(const NativeNumericGuard &) = delete;
+
+	private:
+		TranslationContext &ctx_;
+		std::string savedAlias_;
+		std::map<std::string, std::string> savedRefs_;
+	};
+
 	/// Mint a fresh CTE name ("cte1", "cte2", ...) - a distinct prefix and a
 	/// separate counter from nextAlias()'s "t"+N sequence, so the two can
 	/// never collide even though both are monotonic per-context counters.
@@ -399,6 +435,8 @@ private:
 	const SqlDialect &dialect_;
 	const TypeCatalog *catalog_;
 	std::size_t aliasCounter_;
+	std::string nativeNumericAlias_;
+	std::map<std::string, std::string> nativeNumericRefs_;
 	std::size_t internalVarCounter_ = 0;
 	std::set<std::string> internalVars_;
 	std::set<std::string> tagVars_;

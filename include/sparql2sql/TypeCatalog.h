@@ -76,6 +76,14 @@ struct TypeCatalog {
 	/// `CAST(... AS VARCHAR)` around it is a no-op that can be dropped. False -
 	/// the conservative default - when the type is unknown or anything else.
 	bool isStringType(const std::string &table, const std::string &column) const;
+
+	/// True iff the column's declared SQL type is an integer type (TINYINT ...
+	/// HUGEINT, signed or unsigned). False when unknown.
+	bool isIntegerType(const std::string &table, const std::string &column) const;
+
+	/// True iff the column's declared SQL type is numeric: an integer type, or
+	/// DOUBLE/REAL/FLOAT/DECIMAL/NUMERIC. False when unknown.
+	bool isNumericType(const std::string &table, const std::string &column) const;
 };
 
 /// R2RML Section 10.2's natural mapping from a SQL datatype to an XSD datatype

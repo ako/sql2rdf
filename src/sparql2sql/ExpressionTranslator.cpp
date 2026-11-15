@@ -127,8 +127,41 @@ std::string foldedConstantTwoOperand(bool value, const std::string &leftSql, boo
 // Every typed branch keeps TRY_CAST rather than CAST: a declared rr:datatype
 // can lie about a dirty column, and a hard cast error would kill the whole
 // query where TRY_CAST yields NULL and merely drops the row.
+// A query-text numeric literal ('42', '-2.5') as a bare SQL numeric literal, or
+// "" when `value` is not one. Used opposite a native numeric column, where a
+// TRY_CAST(... AS DOUBLE) constant would make the engine cast the *column*.
+std::string bareNumericLiteral(const std::string &value) {
+	if (value.size() < 3 || value.front() != '\'' || value.back() != '\'') {
+		return std::string();
+	}
+	const std::string text = value.substr(1, value.size() - 2);
+	std::size_t i = (!text.empty() && text[0] == '-') ? 1 : 0;
+	std::size_t intDigits = 0;
+	while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+		++i;
+		++intDigits;
+	}
+	const std::size_t intStart = (text[0] == '-') ? 1 : 0;
+	if (intDigits == 0 || intDigits > 18 || (intDigits > 1 && text[intStart] == '0')) {
+		return std::string();
+	}
+	if (i < text.size() && text[i] == '.') {
+		std::size_t fracDigits = 0;
+		++i;
+		while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+			++i;
+			++fracDigits;
+		}
+		if (fracDigits == 0 || fracDigits > 18) {
+			return std::string();
+		}
+	}
+	return i == text.size() ? text : std::string();
+}
+
 std::string comparison(const TermSql &lhs, const TermSql &rhs, const std::string &op, const SqlDialect &dialect,
-                       bool leftNullable, bool rightNullable) {
+                       bool leftNullable, bool rightNullable, const std::string &leftNative = std::string(),
+                       const std::string &rightNative = std::string()) {
 	const std::string &left = lhs.value;
 	const std::string &right = rhs.value;
 	const TermInfo &leftInfo = lhs.staticInfo;
@@ -138,7 +171,22 @@ std::string comparison(const TermSql &lhs, const TermSql &rhs, const std::string
 		return foldedConstantTwoOperand(op == "<>", left, leftNullable, right, rightNullable, dialect);
 	}
 	if (leftInfo.isNumeric() && rightInfo.isNumeric()) {
-		return "(" + dialect.tryCastToDouble(left) + " " + op + " " + dialect.tryCastToDouble(right) + ")";
+		// A native numeric column compares as itself; a literal opposite one is
+		// written as a number so the engine does not cast the column instead.
+		std::string l = leftNative;
+		std::string r = rightNative;
+		if (!l.empty() && r.empty()) {
+			r = bareNumericLiteral(right);
+		} else if (l.empty() && !r.empty()) {
+			l = bareNumericLiteral(left);
+		}
+		if (l.empty()) {
+			l = dialect.tryCastToDouble(left);
+		}
+		if (r.empty()) {
+			r = dialect.tryCastToDouble(right);
+		}
+		return "(" + l + " " + op + " " + r + ")";
 	}
 	if (leftInfo.isTemporal() && rightInfo.isTemporal()) {
 		const bool bothDates = leftInfo.datatypeIri == xsd::kDate && rightInfo.datatypeIri == xsd::kDate;
@@ -188,23 +236,30 @@ std::string translateBinary(const BinaryExpr &b, const TranslatedPattern &scope,
 	const TermInfo &ri = rhs.staticInfo;
 	const bool leftNullable = mayBeUnbound(*b.left, scope);
 	const bool rightNullable = mayBeUnbound(*b.right, scope);
+	const auto nativeOf = [&](const Expression &operand) {
+		return operand.kind() == ExprKind::VarRef
+		           ? ctx.nativeNumericRef(alias, static_cast<const VarExpr &>(operand).var->name)
+		           : std::string();
+	};
+	const std::string leftNative = nativeOf(*b.left);
+	const std::string rightNative = nativeOf(*b.right);
 	switch (b.op) {
 	case BinaryOp::Or:
 		return "(" + l + " OR " + r + ")";
 	case BinaryOp::And:
 		return "(" + l + " AND " + r + ")";
 	case BinaryOp::Eq:
-		return comparison(lhs, rhs, "=", dialect, leftNullable, rightNullable);
+		return comparison(lhs, rhs, "=", dialect, leftNullable, rightNullable, leftNative, rightNative);
 	case BinaryOp::Ne:
-		return comparison(lhs, rhs, "<>", dialect, leftNullable, rightNullable);
+		return comparison(lhs, rhs, "<>", dialect, leftNullable, rightNullable, leftNative, rightNative);
 	case BinaryOp::Lt:
-		return comparison(lhs, rhs, "<", dialect, leftNullable, rightNullable);
+		return comparison(lhs, rhs, "<", dialect, leftNullable, rightNullable, leftNative, rightNative);
 	case BinaryOp::Gt:
-		return comparison(lhs, rhs, ">", dialect, leftNullable, rightNullable);
+		return comparison(lhs, rhs, ">", dialect, leftNullable, rightNullable, leftNative, rightNative);
 	case BinaryOp::Le:
-		return comparison(lhs, rhs, "<=", dialect, leftNullable, rightNullable);
+		return comparison(lhs, rhs, "<=", dialect, leftNullable, rightNullable, leftNative, rightNative);
 	case BinaryOp::Ge:
-		return comparison(lhs, rhs, ">=", dialect, leftNullable, rightNullable);
+		return comparison(lhs, rhs, ">=", dialect, leftNullable, rightNullable, leftNative, rightNative);
 	case BinaryOp::Add:
 		return arithmetic(l, li, r, ri, "+", dialect);
 	case BinaryOp::Sub:
