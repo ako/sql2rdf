@@ -255,3 +255,46 @@ TEST_CASE("propagateEmpty: an inner join with an unsatisfiable side is empty", "
 	CHECK(contains(sql, "WHERE FALSE"));
 	CHECK_FALSE(contains(sql, "\"EMP\""));
 }
+
+// --- Shared scan for arms pinned to one row by a key ---------------------
+
+namespace {
+
+std::size_t countOccurrences(const std::string &text, const std::string &needle) {
+	std::size_t n = 0;
+	for (std::size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + 1)) {
+		++n;
+	}
+	return n;
+}
+
+} // namespace
+
+TEST_CASE("Shared scan: arms over one keyed row read a single CTE", "[sparql2sql]") {
+	const std::string query = "SELECT ?p ?v WHERE { <http://data.example.com/employee/7369> ?p ?v }";
+
+	// Without a key, every arm scans EMP itself.
+	const TypeCatalog typesOnly = typesOnlyCatalog();
+	const std::string plain = translate(query, &typesOnly);
+	CHECK(plain.find("AS s WHERE") == std::string::npos);
+	CHECK(countOccurrences(plain, "FROM \"EMP\" AS") > 2);
+
+	// With EMPNO declared unique, the arms that read only EMP share one scan.
+	TypeCatalog catalog = typesOnlyCatalog();
+	catalog.uniqueKeys["EMP"].push_back(std::set<std::string> {"EMPNO"});
+	const std::string shared = translate(query, &catalog);
+	INFO(shared);
+	CHECK(shared.rfind("WITH ", 0) == 0);
+	CHECK(countOccurrences(shared, "SELECT * FROM \"EMP\" AS s WHERE s.\"EMPNO\" = 7369") == 1);
+	// The department arm joins EMP to DEPT, so it keeps its own source.
+	CHECK(countOccurrences(shared, "FROM \"EMP\" AS t") <= 1);
+}
+
+TEST_CASE("Shared scan: no CTE when the shared conditions do not pin a key", "[sparql2sql]") {
+	TypeCatalog catalog = typesOnlyCatalog();
+	catalog.uniqueKeys["EMP"].push_back(std::set<std::string> {"EMPNO"});
+	// One property per arm, a filter on a non-key column: several rows per arm.
+	const std::string sql = translate("SELECT ?e ?p ?v WHERE { ?e ?p ?v ; ex:name \"SMITH\" }", &catalog);
+	INFO(sql);
+	CHECK(sql.find("AS s WHERE") == std::string::npos);
+}

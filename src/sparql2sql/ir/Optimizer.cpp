@@ -1787,6 +1787,171 @@ void stripProvenDistinct(RelNode &node, const TypeCatalog *catalog) {
 	}
 }
 
+// One union arm that may read a shared scan: a single-source block over a base
+// table, with the equality conjuncts it puts on that table's columns.
+struct ScanArm {
+	SpjRelation *spj = nullptr;
+	/// Each `alias."col" = <value>` conjunct, with the alias replaced by a
+	/// marker so arms over different aliases compare equal, mapped to its column.
+	std::map<std::string, std::string> equalities;
+};
+
+// Strip one pair of enclosing parentheses, when they enclose the whole text.
+std::string stripOuterParens(const std::string &text) {
+	if (text.size() < 2 || text.front() != '(' || text.back() != ')') {
+		return text;
+	}
+	int depth = 0;
+	for (std::size_t i = 0; i < text.size(); ++i) {
+		if (text[i] == '(') {
+			++depth;
+		} else if (text[i] == ')') {
+			--depth;
+			if (depth == 0 && i + 1 != text.size()) {
+				return text; // "(a) AND (b)": the first paren closes early
+			}
+		}
+	}
+	return text.substr(1, text.size() - 2);
+}
+
+const char *const kScanAliasMarker = "\x01";
+
+bool collectScanArm(SpjRelation &spj, const SqlDialect &dialect, ScanArm &out) {
+	if (spj.sources.size() != 1) {
+		return false;
+	}
+	const SpjSource &source = spj.sources.front();
+	if (source.tableIdentity.empty() || !source.parentAlias.empty() || source.alias.empty() ||
+	    source.sql != dialect.quoteIdentifier(source.tableIdentity) + " AS " + source.alias) {
+		return false; // a view, a join, or not a plain base-table source
+	}
+	const std::string prefix = source.alias + ".";
+	for (const auto &cond : spj.whereConds) {
+		const std::string c = stripOuterParens(cond);
+		if (c.compare(0, prefix.size(), prefix) != 0) {
+			continue;
+		}
+		const std::size_t eq = c.find(" = ");
+		if (eq == std::string::npos) {
+			continue;
+		}
+		const std::string lhs = c.substr(prefix.size(), eq - prefix.size());
+		const std::string rhs = c.substr(eq + 3);
+		// The left side must be one quoted column, the right side free of this
+		// block's alias (a constant, not another column of the row).
+		if (lhs.size() < 2 || lhs.front() != '"' || lhs.back() != '"' || lhs.find('"', 1) != lhs.size() - 1 ||
+		    rhs.find(prefix) != std::string::npos) {
+			continue;
+		}
+		out.equalities[std::string(kScanAliasMarker) + "." + lhs + " = " + rhs] = lhs.substr(1, lhs.size() - 2);
+	}
+	out.spj = &spj;
+	return !out.equalities.empty();
+}
+
+// Union arms that read the same base table under equality conditions pinning
+// one of its declared keys (a constant subject IRI, say) select at most one
+// row, the same row in every arm. An unbound predicate over one subject
+// produces exactly that: an arm per mapped property, each scanning the table
+// again. Hoisting the common conditions into one CTE lets the engine scan once
+// (DuckDB materialises a CTE referenced more than once), and each arm reads
+// that single row. Requiring a covered key keeps the shared result tiny: a
+// shared scan of a non-key filter could materialise millions of rows.
+void shareKeyedScans(RelNode &node, const TypeCatalog *catalog, TranslationContext &ctx);
+
+void shareKeyedScansInUnion(UnionByNameNode &u, const TypeCatalog *catalog, TranslationContext &ctx) {
+	std::map<std::string, std::vector<ScanArm>> byTable;
+	for (auto &arm : u.arms) {
+		if (arm->kind() != RelKind::Spj) {
+			continue;
+		}
+		ScanArm scan;
+		auto &spj = static_cast<SpjRelation &>(*arm);
+		if (collectScanArm(spj, ctx.dialect(), scan)) {
+			byTable[spj.sources.front().tableIdentity].push_back(std::move(scan));
+		}
+	}
+	for (auto &entry : byTable) {
+		std::vector<ScanArm> &arms = entry.second;
+		if (arms.size() < 2) {
+			continue;
+		}
+		// The equalities every arm shares.
+		std::map<std::string, std::string> common = arms.front().equalities;
+		for (std::size_t i = 1; i < arms.size(); ++i) {
+			for (auto it = common.begin(); it != common.end();) {
+				it = arms[i].equalities.count(it->first) ? std::next(it) : common.erase(it);
+			}
+		}
+		std::set<std::string> columns;
+		for (const auto &c : common) {
+			columns.insert(c.second);
+		}
+		if (columns.empty() || !catalog->coversUniqueKey(entry.first, columns)) {
+			continue;
+		}
+		std::string where;
+		std::string identity = "keyscan:" + entry.first;
+		for (const auto &c : common) {
+			where += (where.empty() ? "" : " AND ") + replaceAll(c.first, kScanAliasMarker, "s");
+			identity += "\x1f" + c.first;
+		}
+		const std::string name = ctx.viewCteName(
+		    identity, "SELECT * FROM " + ctx.dialect().quoteIdentifier(entry.first) + " AS s WHERE " + where);
+		for (auto &arm : arms) {
+			SpjSource &source = arm.spj->sources.front();
+			const std::string marker = std::string(kScanAliasMarker) + ".";
+			std::vector<std::string> kept;
+			for (const auto &cond : arm.spj->whereConds) {
+				const std::string normalized = replaceAll(stripOuterParens(cond), source.alias + ".", marker);
+				if (!common.count(normalized)) {
+					kept.push_back(cond);
+				}
+			}
+			arm.spj->whereConds = std::move(kept);
+			source.sql = name + " AS " + source.alias;
+		}
+	}
+}
+
+void shareKeyedScans(RelNode &node, const TypeCatalog *catalog, TranslationContext &ctx) {
+	switch (node.kind()) {
+	case RelKind::UnionByName: {
+		auto &u = static_cast<UnionByNameNode &>(node);
+		for (auto &arm : u.arms) {
+			shareKeyedScans(*arm, catalog, ctx);
+		}
+		shareKeyedScansInUnion(u, catalog, ctx);
+		break;
+	}
+	case RelKind::Join: {
+		auto &j = static_cast<JoinNode &>(node);
+		shareKeyedScans(*j.left, catalog, ctx);
+		shareKeyedScans(*j.right, catalog, ctx);
+		break;
+	}
+	case RelKind::AntiJoin: {
+		auto &a = static_cast<AntiJoinNode &>(node);
+		shareKeyedScans(*a.left, catalog, ctx);
+		shareKeyedScans(*a.right, catalog, ctx);
+		break;
+	}
+	case RelKind::Filter:
+		shareKeyedScans(*static_cast<FilterNode &>(node).child, catalog, ctx);
+		break;
+	case RelKind::Bind:
+		shareKeyedScans(*static_cast<BindNode &>(node).child, catalog, ctx);
+		break;
+	case RelKind::TransitiveClosure:
+	case RelKind::Spj:
+	case RelKind::Raw:
+	case RelKind::SingleRow:
+	case RelKind::Empty:
+		break;
+	}
+}
+
 } // namespace
 
 bool isIdentityProjection(const std::vector<ColumnInfo> &schema, const std::vector<std::string> &outputVars) {
@@ -1831,6 +1996,9 @@ RelNodePtr optimize(RelNodePtr root, const OptimizerOptions &opts) {
 	redundancyWalk(*root);
 	if (opts.ctx != nullptr) {
 		constantColumnWalk(*root, opts.ctx->dialect());
+	}
+	if (opts.ctx != nullptr && opts.catalog != nullptr) {
+		shareKeyedScans(*root, opts.catalog, *opts.ctx);
 	}
 	// Unconditional: a MINUS's subtracted side is a semi-join test no matter
 	// whether the enclosing query itself dedups.

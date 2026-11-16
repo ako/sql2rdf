@@ -48,7 +48,10 @@ struct OptimizerOptions {
 /// an "<x> = '<literal>'" conjunct in the same block, and - when a
 /// TranslationContext is supplied - a comparison against a column an
 /// rr:sqlQuery view's own SELECT list defines as a fixed literal), and (when
-/// the enclosing query dedups) DISTINCT stripping.
+/// the enclosing query dedups) DISTINCT stripping. With a catalog and a
+/// TranslationContext, union arms that read the same base table under equality
+/// conditions pinning a declared key also share one scan: the conditions move
+/// into a CTE the arms read instead of the table.
 RelNodePtr optimize(RelNodePtr root, const OptimizerOptions &opts);
 
 /// True when projecting `outputVars` (in order) over `schema` is a bare identity:
