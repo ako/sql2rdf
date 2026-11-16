@@ -2658,3 +2658,31 @@ TEST_CASE("reasoning: a transitive property follows chains of any length") {
 	// CONSTRUCT returns the entailed triples too.
 	CHECK(runOwl(*conn, "CONSTRUCT WHERE { ?a ex:next ?b }").size() == 3);
 }
+
+TEST_CASE("shared scan: one subject's properties, the same rows with and without the key") {
+	auto conn = makeSeededDatabase();
+	R2RMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_R2RML_DIR "example_emp_dept.ttl");
+	const std::string query = "PREFIX ex: <http://example.com/ns#>\n"
+	                          "SELECT ?p ?v WHERE { <http://data.example.com/employee/7369> ?p ?v }";
+	sparql2sql::TypeCatalog catalog;
+	sql2rdf::loadTypeCatalog(*conn, &mapping, catalog); // EMP has a PRIMARY KEY on EMPNO
+	sparql2sql::TypeCatalog noKeys = catalog;
+	noKeys.uniqueKeys.clear();
+
+	auto sortRows = [](std::vector<Row> rows) {
+		std::sort(rows.begin(), rows.end());
+		return rows;
+	};
+	auto shared = sortRows(runWithCatalog(*conn, query, mapping, &catalog));
+	auto separate = sortRows(runWithCatalog(*conn, query, mapping, &noKeys));
+	{
+		Parser sparqlParser;
+		DuckDbDialect dialect;
+		CHECK(translateQuery(*sparqlParser.parseString(query), mapping, dialect, &catalog).find("AS s WHERE") !=
+		      std::string::npos);
+	}
+	CHECK(shared.size() >= 4); // type, name, knows, department
+	CHECK(shared == separate);
+	CHECK(containsRow(shared, {{"V_P", "http://example.com/ns#name"}, {"V_V", "SMITH"}}));
+}

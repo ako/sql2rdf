@@ -713,6 +713,16 @@ emitting SQL strings directly, then applies a fixed pipeline of semantics-preser
 7. **DISTINCT elimination.** The per-pattern `SELECT DISTINCT` is dropped when the enclosing query
    is `SELECT DISTINCT`/`ASK`, and likewise inside an EXISTS body (an existence check cannot see
    duplicates).
+8. **Shared scan for a keyed row.** Union arms that each read the same base table under the same
+   equality conditions, where those conditions pin a declared unique key, all select the same single
+   row. An unbound predicate over one subject (`<http://ex/emp/7369> ?p ?v`) produces exactly that:
+   one arm per mapped property, each scanning the table again. The common conditions move into one
+   CTE (`cteN AS (SELECT * FROM "EMP" AS s WHERE s."EMPNO" = 7369)`) that every such arm reads, so
+   the table is scanned once; DuckDB materialises a CTE referenced more than once. Requires a catalog
+   (with the key) and a `TranslationContext`. Only conditions covering a key qualify, so the shared
+   result is at most one row; arms that join (a referencing object map) or read a view keep their own
+   source. On 10M Parquet orders this takes "all properties of one order" from about 3× plain SQL to
+   about the same as plain SQL.
 
 **A `VALUES` column bound to a single constant term is folded into the triple patterns that read
 it**, before any of the above (`sparql2sql/ValuesFolder.h`). `VALUES ?s { <http://ex/emp/7369> }`
