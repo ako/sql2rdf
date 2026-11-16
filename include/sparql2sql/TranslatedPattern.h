@@ -315,6 +315,49 @@ public:
 		return tagVars_.count(varName) != 0;
 	}
 
+	/// Native companion columns for aggregates: when the query's root relation
+	/// is a single SPJ block, translateQueryPattern asks the renderer to expose,
+	/// beside a variable's lexical form, the uncast table value it was built
+	/// from (`n_<var>`, see mangleVarNative). `root` identifies that block, so
+	/// nested blocks rendered on the way are never touched. `exprs` maps each
+	/// variable to the SQL expression to project, in the block's own scope.
+	void setNativeRoot(const void *root, std::map<std::string, std::string> exprs) {
+		nativeRoot_ = root;
+		nativeRootExprs_ = std::move(exprs);
+	}
+
+	const void *nativeRoot() const {
+		return nativeRoot_;
+	}
+
+	const std::map<std::string, std::string> &nativeRootExprs() const {
+		return nativeRootExprs_;
+	}
+
+	/// After rendering: the alias-qualified companion column an aggregate over
+	/// `varName` may use instead of re-parsing the lexical form, and what it
+	/// may use it for. Empty when there is none.
+	struct NativeAggregateRef {
+		std::string ref;
+		/// Which aggregate casts give the same answer from the native value as
+		/// from the lexical form: DOUBLE from any numeric column, fixed-point
+		/// DECIMAL only from an integer or DECIMAL column (a DOUBLE 0.1 is not
+		/// the decimal 0.1), BIGINT only from an integer column.
+		bool numeric = false;
+		bool exactDecimal = false;
+		bool integral = false;
+		bool countable = false; ///< COUNT(DISTINCT) over it equals COUNT(DISTINCT) over the term
+	};
+
+	void setNativeAggregateRefs(std::map<std::string, NativeAggregateRef> refs) {
+		nativeAggregateRefs_ = std::move(refs);
+	}
+
+	NativeAggregateRef nativeAggregateRef(const std::string &varName) const {
+		auto it = nativeAggregateRefs_.find(varName);
+		return it == nativeAggregateRefs_.end() ? NativeAggregateRef() : it->second;
+	}
+
 	/// Whether the top-level SELECT must carry a tag for every output
 	/// variable (TranslateOptions::termTags).
 	void setResultTags(bool on) {
@@ -464,6 +507,9 @@ private:
 	std::vector<CteDef> viewCtes_;
 	bool prettyPrint_;
 	bool resultTags_ = false;
+	const void *nativeRoot_ = nullptr;
+	std::map<std::string, std::string> nativeRootExprs_;
+	std::map<std::string, NativeAggregateRef> nativeAggregateRefs_;
 	std::size_t subqueryDepth_ = 0;
 	GraphConstraint activeGraph_;
 	ActiveDataset dataset_;
@@ -487,6 +533,12 @@ std::string mangleVar(const std::string &sparqlVarName, const SqlDialect &dialec
 /// combineByName's NULL padding: this column is SQL NULL exactly when the
 /// matching "v_" column is.
 std::string mangleVarTag(const std::string &sparqlVarName, const SqlDialect &dialect);
+
+/// The SQL column name of a variable's **native companion**: the uncast table
+/// value its lexical form was built from, projected only for aggregates (see
+/// TranslationContext::setNativeRoot). Prefix "n_", distinct from "v_", "d_"
+/// and "k_".
+std::string mangleVarNative(const std::string &sparqlVarName, const SqlDialect &dialect);
 
 /// Join `items` as a SELECT/GROUP BY/ORDER BY-style list: in compact mode,
 /// ", "-separated on one line (the introducing keyword supplies its own

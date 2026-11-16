@@ -12,6 +12,10 @@ std::string mangleVarTag(const std::string &sparqlVarName, const SqlDialect &dia
 	return dialect.quoteIdentifier("d_" + sparqlVarName);
 }
 
+std::string mangleVarNative(const std::string &sparqlVarName, const SqlDialect &dialect) {
+	return dialect.quoteIdentifier("n_" + sparqlVarName);
+}
+
 std::string joinColumnList(const std::vector<std::string> &items, const TranslationContext &ctx) {
 	if (items.empty()) {
 		return std::string();
