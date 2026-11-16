@@ -21,6 +21,9 @@ namespace sparql2sql {
 namespace {
 
 std::string renderNode(const RelNode &node, TranslationContext &ctx);
+using ExtraProjections = std::vector<std::pair<std::string, std::string>>;
+std::string renderTransitiveClosure(const TransitiveClosureNode &tc, TranslationContext &ctx,
+                                    const ExtraProjections *extra);
 
 // A TranslatedPattern carrying a node's schema *description* but no SQL -
 // enough for translateExpression's in-scope/optionality checks and its static
@@ -147,7 +150,6 @@ std::string keyTagComparison(const EquiKey &k, TranslationContext &ctx, const st
 // the derived-table boundary so it can compare native key columns.
 // Some magic numbers for the reserve call, try and allocate sufficient space
 // for the common case without over-allocating too much.
-using ExtraProjections = std::vector<std::pair<std::string, std::string>>;
 
 bool isIdentChar(char ch) {
 	return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_';
@@ -364,12 +366,96 @@ std::string renderSpj(const SpjRelation &rel, TranslationContext &ctx, const Ext
 	return sql;
 }
 
+// The raw keys a transitive closure can recurse on: one pair of placeholder
+// columns per template placeholder, `from` side and `to` side of the step.
+// Non-empty only when the step is one SPJ block whose two endpoints are the
+// same invertible template over type-comparable columns (nativeKeyPairs's
+// conditions), so that equal keys mean equal IRIs and the other way round.
+// Then each hop joins on integer (or whatever the key type is) columns rather
+// than on IRI text built for every edge, and the closure can hand its keys to
+// the join above it.
+std::vector<NativeKeyPair> closureKeyPairs(const TransitiveClosureNode &tc, const TypeCatalog *catalog) {
+	if (tc.step == nullptr || tc.step->kind() != RelKind::Spj) {
+		return {};
+	}
+	const ColumnInfo *from = tc.step->column(tc.fromVar);
+	const ColumnInfo *to = tc.step->column(tc.toVar);
+	if (from == nullptr || to == nullptr) {
+		return {};
+	}
+	return nativeKeyPairs(*from, *to, catalog);
+}
+
+// Bare names of the closure CTE's key columns: `cte_k<i>` for the reached
+// node of a unary closure, `cte_fk<i>`/`cte_tk<i>` for the pairs closure.
+std::string closureKeyName(const std::string &prefix, std::size_t i, const SqlDialect &dialect) {
+	return dialect.quoteIdentifier(prefix + std::to_string(i));
+}
+
+// A ColumnInfo describing `var` of a key-carrying closure as the template it
+// is, with placeholder refs that name the closure's own key columns - so
+// planNativeKeys can join the closure to a neighbouring scan on keys, the
+// same way it joins two scans. Null when `var` is not an endpoint the closure
+// carries keys for.
+std::unique_ptr<ColumnInfo> closureColumnInfo(const TransitiveClosureNode &tc, const std::string &var,
+                                              const TypeCatalog *catalog, const SqlDialect &dialect) {
+	if (tc.mode == TransitiveClosureNode::Mode::BothBound || closureKeyPairs(tc, catalog).empty()) {
+		return nullptr;
+	}
+	const auto &schema = tc.schema();
+	std::string prefix;
+	const ColumnInfo *source = nullptr;
+	if (tc.mode == TransitiveClosureNode::Mode::BothVars) {
+		if (!schema.empty() && schema[0].var == var) {
+			prefix = "cte_fk";
+			source = tc.step->column(tc.fromVar);
+		} else if (!tc.sameEndpointVar && schema.size() > 1 && schema[1].var == var) {
+			prefix = "cte_tk";
+			source = tc.step->column(tc.toVar);
+		}
+	} else if (!schema.empty() && schema[0].var == var) {
+		prefix = "cte_k";
+		bool forward = tc.mode != TransitiveClosureNode::Mode::BackwardFromObject;
+		source = tc.step->column(forward ? tc.toVar : tc.fromVar);
+	}
+	if (source == nullptr) {
+		return nullptr;
+	}
+	std::unique_ptr<ColumnInfo> info(new ColumnInfo(*source));
+	info->var = var;
+	for (std::size_t i = 0; i < info->templateColumnRefs.size(); ++i) {
+		info->templateColumnRefs[i] = closureKeyName(prefix, i, dialect);
+	}
+	return info;
+}
+
+// The column a native-key plan sees for `var` on one side of a join: the
+// key's own ColumnInfo for a scan, the key-carrying description for a closure.
+// Null when the side cannot expose native columns at all.
+const ColumnInfo *nativeSideColumn(const RelNode &side, const ColumnInfo &keyCol, TranslationContext &ctx,
+                                   std::unique_ptr<ColumnInfo> &holder) {
+	if (side.kind() == RelKind::Spj) {
+		// The block's own column, not the key's copy: the key was described
+		// when the join was built, and flattening may since have merged this
+		// side into a block whose column has different (better) provenance.
+		const ColumnInfo *own = side.column(keyCol.var);
+		return own != nullptr ? own : &keyCol;
+	}
+	if (side.kind() == RelKind::TransitiveClosure) {
+		holder = closureColumnInfo(static_cast<const TransitiveClosureNode &>(side), keyCol.var, ctx.catalog(),
+		                           ctx.dialect());
+		return holder.get();
+	}
+	return nullptr;
+}
+
 // Plan native-column comparisons for a join across the derived-table boundary.
 // Only the projected term text is in scope out there, so a native comparison
 // needs each side's base columns exposed as extra hidden projections, which is
 // only possible when the child renders its own SELECT list - i.e. when it is
-// directly an SpjRelation (the shape flattening produces). Anything else, and
-// any null-tolerant key, keeps the term-text comparison.
+// directly an SpjRelation (the shape flattening produces), or a transitive
+// closure that recurses on raw keys (closureColumnInfo). Anything else, and any
+// null-tolerant key, keeps the term-text comparison.
 //
 // This is the rewrite an engine cannot perform for itself: R2RML subjects are
 // nearly always rr:template IRIs, so without it every subject join hashes
@@ -379,7 +465,10 @@ void planNativeKeys(const std::vector<EquiKey> &keys, const RelNode &left, const
                     ExtraProjections &leftExtra, ExtraProjections &rightExtra, std::vector<std::string> &conds,
                     std::vector<bool> &rewritten) {
 	rewritten.assign(keys.size(), false);
-	if (left.kind() != RelKind::Spj || right.kind() != RelKind::Spj) {
+	auto exposes = [](const RelNode &n) {
+		return n.kind() == RelKind::Spj || n.kind() == RelKind::TransitiveClosure;
+	};
+	if (!exposes(left) || !exposes(right)) {
 		return;
 	}
 	const SqlDialect &dialect = ctx.dialect();
@@ -387,7 +476,14 @@ void planNativeKeys(const std::vector<EquiKey> &keys, const RelNode &left, const
 		if (keys[i].nullSafe) {
 			continue;
 		}
-		std::vector<NativeKeyPair> pairs = nativeKeyPairs(keys[i].leftCol, keys[i].rightCol, ctx.catalog());
+		std::unique_ptr<ColumnInfo> leftHolder;
+		std::unique_ptr<ColumnInfo> rightHolder;
+		const ColumnInfo *lc = nativeSideColumn(left, keys[i].leftCol, ctx, leftHolder);
+		const ColumnInfo *rc = nativeSideColumn(right, keys[i].rightCol, ctx, rightHolder);
+		if (lc == nullptr || rc == nullptr) {
+			continue;
+		}
+		std::vector<NativeKeyPair> pairs = nativeKeyPairs(*lc, *rc, ctx.catalog());
 		if (pairs.empty()) {
 			continue;
 		}
@@ -406,6 +502,9 @@ void planNativeKeys(const std::vector<EquiKey> &keys, const RelNode &left, const
 std::string renderChild(const RelNode &node, TranslationContext &ctx, const ExtraProjections &extra) {
 	if (!extra.empty() && node.kind() == RelKind::Spj) {
 		return renderSpj(static_cast<const SpjRelation &>(node), ctx, &extra);
+	}
+	if (!extra.empty() && node.kind() == RelKind::TransitiveClosure) {
+		return renderTransitiveClosure(static_cast<const TransitiveClosureNode &>(node), ctx, &extra);
 	}
 	return renderNode(node, ctx);
 }
@@ -485,6 +584,18 @@ std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
 		projectExprs.push_back(rightAlias + "." + mangleVar(v, dialect) + " AS " + mangleVar(v, dialect));
 		if (ctx.needsTag(v)) {
 			projectExprs.push_back(rightAlias + "." + mangleVarTag(v, dialect) + " AS " + mangleVarTag(v, dialect));
+		}
+	}
+
+	// A native-aggregate block below this join (see Translator.cpp): pass its
+	// n_<var> companions up, so the aggregate above reads table values.
+	for (const auto &child :
+	     {std::make_pair(join.left.get(), &leftAlias), std::make_pair(join.right.get(), &rightAlias)}) {
+		if (ctx.nativeRoot() == child.first) {
+			for (const auto &n : ctx.nativeRootExprs()) {
+				const std::string col = mangleVarNative(n.first, dialect);
+				projectExprs.push_back(*child.second + "." + col + " AS " + col);
+			}
 		}
 	}
 
@@ -637,14 +748,45 @@ std::string renderBind(const BindNode &b, TranslationContext &ctx) {
 // Every recursive term is combined with its seed via a deduplicating UNION
 // (never UNION ALL): this is what makes the closure terminate on cyclic edge
 // data, which real graphs frequently have.
-std::string renderTransitiveClosure(const TransitiveClosureNode &tc, TranslationContext &ctx) {
+std::string renderTransitiveClosure(const TransitiveClosureNode &tc, TranslationContext &ctx,
+                                    const ExtraProjections *extra) {
 	const SqlDialect &dialect = ctx.dialect();
 	std::string fromCol = mangleVar(tc.fromVar, dialect);
 	std::string toCol = mangleVar(tc.toVar, dialect);
 
+	// Raw-key recursion (see closureKeyPairs): the step projects each
+	// endpoint's placeholder columns as k_f<i>/k_t<i> beside the IRIs, the
+	// closure carries the reached node's keys beside its IRI, and every hop
+	// joins on keys. The IRI still rides along, so the anchor and target
+	// comparisons and the output column are unchanged; it is a function of
+	// the keys, so the deduplicating UNION keeps exactly the rows it did.
+	const std::vector<NativeKeyPair> keyPairs = closureKeyPairs(tc, ctx.catalog());
+	const std::size_t nKeys = keyPairs.size();
+	auto stepKey = [&](bool fromSide, std::size_t i) {
+		return closureKeyName(fromSide ? "k_f" : "k_t", i, dialect);
+	};
+
 	std::string stepCte = ctx.nextCteName();
-	ctx.addCte(stepCte, renderNode(*tc.step, ctx));
+	if (nKeys == 0) {
+		ctx.addCte(stepCte, renderNode(*tc.step, ctx));
+	} else {
+		ExtraProjections stepExtra;
+		for (std::size_t i = 0; i < nKeys; ++i) {
+			stepExtra.emplace_back(stepKey(true, i), keyPairs[i].leftRef);
+			stepExtra.emplace_back(stepKey(false, i), keyPairs[i].rightRef);
+		}
+		ctx.addCte(stepCte, renderSpj(static_cast<const SpjRelation &>(*tc.step), ctx, &stepExtra));
+	}
 	std::string closureCte = ctx.nextCteName();
+
+	// Hidden projections a parent join asked for (planNativeKeys): bare key
+	// column names of this closure's CTE, the only source of the final SELECT.
+	std::string extraProject;
+	if (extra != nullptr) {
+		for (const auto &e : *extra) {
+			extraProject += ", " + e.second + " AS " + e.first;
+		}
+	}
 
 	// Invariant columns (see TransitiveClosureNode::invariantVars) keep their
 	// own mangled names all the way through - unlike the endpoints, which are
@@ -677,6 +819,25 @@ std::string renderTransitiveClosure(const TransitiveClosureNode &tc, Translation
 		}
 		return text;
 	};
+	// ", a.<k_t0> AS <cte_k0>, ..." / ", a.<k_t0>, ..." / "a.<cte_k0> = b.<k_f0> AND ...".
+	auto keyList = [&](const std::string &alias, bool fromSide, const std::string &asPrefix) {
+		std::string out;
+		for (std::size_t i = 0; i < nKeys; ++i) {
+			out += ", " + alias + "." + stepKey(fromSide, i);
+			if (!asPrefix.empty()) {
+				out += " AS " + closureKeyName(asPrefix, i, dialect);
+			}
+		}
+		return out;
+	};
+	auto keyOn = [&](const std::string &acc, const std::string &accPrefix, const std::string &step, bool fromSide) {
+		std::string on;
+		for (std::size_t i = 0; i < nKeys; ++i) {
+			on += (i > 0 ? " AND " : "") + acc + "." + closureKeyName(accPrefix, i, dialect) + " = " + step + "." +
+			      stepKey(fromSide, i);
+		}
+		return on;
+	};
 
 	if (tc.mode == TransitiveClosureNode::Mode::BothVars) {
 		std::string cteFrom = dialect.quoteIdentifier("cte_from");
@@ -685,11 +846,16 @@ std::string renderTransitiveClosure(const TransitiveClosureNode &tc, Translation
 		std::string s2 = ctx.nextAlias();
 		std::string r = ctx.nextAlias();
 		std::string seed = "SELECT " + s1 + "." + fromCol + " AS " + cteFrom + ", " + s1 + "." + toCol + " AS " +
-		                   cteTo + subst(invSeed, "%SEED%", s1) + " FROM " + stepCte + " AS " + s1;
-		std::string recursive = "SELECT " + r + "." + cteFrom + ", " + s2 + "." + toCol +
-		                        subst(invRecursive, "%ACC%", r) + " FROM " + closureCte + " AS " + r + " JOIN " +
-		                        stepCte + " AS " + s2 + " ON " + r + "." + cteTo + " = " + s2 + "." + fromCol +
-		                        invOn(r, s2);
+		                   cteTo + keyList(s1, true, "cte_fk") + keyList(s1, false, "cte_tk") +
+		                   subst(invSeed, "%SEED%", s1) + " FROM " + stepCte + " AS " + s1;
+		std::string carriedFromKeys;
+		for (std::size_t i = 0; i < nKeys; ++i) {
+			carriedFromKeys += ", " + r + "." + closureKeyName("cte_fk", i, dialect);
+		}
+		std::string hop = nKeys == 0 ? r + "." + cteTo + " = " + s2 + "." + fromCol : keyOn(r, "cte_tk", s2, true);
+		std::string recursive = "SELECT " + r + "." + cteFrom + ", " + s2 + "." + toCol + carriedFromKeys +
+		                        keyList(s2, false, "") + subst(invRecursive, "%ACC%", r) + " FROM " + closureCte +
+		                        " AS " + r + " JOIN " + stepCte + " AS " + s2 + " ON " + hop + invOn(r, s2);
 		ctx.addCte(closureCte, seed + " UNION " + recursive);
 
 		std::string c = ctx.nextAlias();
@@ -697,13 +863,13 @@ std::string renderTransitiveClosure(const TransitiveClosureNode &tc, Translation
 			// Subject and object share one variable (`?x p+ ?x`): only the
 			// diagonal of the pairs closure satisfies the pattern.
 			return "SELECT " + c + "." + cteFrom + " AS " + mangleVar(tc.schema()[0].var, dialect) +
-			       closureTagProjection(tc.schema()[0], ctx) + subst(invProject, "%C%", c) + " FROM " + closureCte +
-			       " AS " + c + " WHERE " + c + "." + cteFrom + " = " + c + "." + cteTo;
+			       closureTagProjection(tc.schema()[0], ctx) + subst(invProject, "%C%", c) + extraProject + " FROM " +
+			       closureCte + " AS " + c + " WHERE " + c + "." + cteFrom + " = " + c + "." + cteTo;
 		}
 		return "SELECT " + c + "." + cteFrom + " AS " + mangleVar(tc.schema()[0].var, dialect) +
 		       closureTagProjection(tc.schema()[0], ctx) + ", " + c + "." + cteTo + " AS " +
 		       mangleVar(tc.schema()[1].var, dialect) + closureTagProjection(tc.schema()[1], ctx) +
-		       subst(invProject, "%C%", c) + " FROM " + closureCte + " AS " + c;
+		       subst(invProject, "%C%", c) + extraProject + " FROM " + closureCte + " AS " + c;
 	}
 
 	// Unary reachable-set: ForwardFromSubject/BackwardFromObject walk the
@@ -721,12 +887,13 @@ std::string renderTransitiveClosure(const TransitiveClosureNode &tc, Translation
 	// One hop from the anchor, not the anchor itself: this node's minimum
 	// cardinality is always 1 (see class comment), so seeding with the anchor
 	// verbatim would wrongly include it as a zero-hop "reachable" result.
-	std::string seed = "SELECT " + seedAlias + "." + landCol + " AS " + cteNode + subst(invSeed, "%SEED%", seedAlias) +
-	                   " FROM " + stepCte + " AS " + seedAlias + " WHERE " + seedAlias + "." + walkCol + " = " +
-	                   tc.anchorLiteral;
-	std::string recursive = "SELECT " + s + "." + landCol + subst(invRecursive, "%ACC%", r) + " FROM " + closureCte +
-	                        " AS " + r + " JOIN " + stepCte + " AS " + s + " ON " + r + "." + cteNode + " = " + s +
-	                        "." + walkCol + invOn(r, s);
+	std::string seed = "SELECT " + seedAlias + "." + landCol + " AS " + cteNode +
+	                   keyList(seedAlias, !forward, "cte_k") + subst(invSeed, "%SEED%", seedAlias) + " FROM " +
+	                   stepCte + " AS " + seedAlias + " WHERE " + seedAlias + "." + walkCol + " = " + tc.anchorLiteral;
+	std::string hop = nKeys == 0 ? r + "." + cteNode + " = " + s + "." + walkCol : keyOn(r, "cte_k", s, forward);
+	std::string recursive = "SELECT " + s + "." + landCol + keyList(s, !forward, "") + subst(invRecursive, "%ACC%", r) +
+	                        " FROM " + closureCte + " AS " + r + " JOIN " + stepCte + " AS " + s + " ON " + hop +
+	                        invOn(r, s);
 	ctx.addCte(closureCte, seed + " UNION " + recursive);
 
 	if (tc.mode == TransitiveClosureNode::Mode::BothBound) {
@@ -747,7 +914,8 @@ std::string renderTransitiveClosure(const TransitiveClosureNode &tc, Translation
 
 	std::string c = ctx.nextAlias();
 	return "SELECT " + c + "." + cteNode + " AS " + mangleVar(tc.schema()[0].var, dialect) +
-	       closureTagProjection(tc.schema()[0], ctx) + subst(invProject, "%C%", c) + " FROM " + closureCte + " AS " + c;
+	       closureTagProjection(tc.schema()[0], ctx) + subst(invProject, "%C%", c) + extraProject + " FROM " +
+	       closureCte + " AS " + c;
 }
 
 // A Raw leaf's SQL was built during folding, before any tag was demanded, so it
@@ -811,7 +979,7 @@ std::string renderNode(const RelNode &node, TranslationContext &ctx) {
 	case RelKind::Empty:
 		return renderEmpty(static_cast<const EmptyNode &>(node), ctx);
 	case RelKind::TransitiveClosure:
-		return renderTransitiveClosure(static_cast<const TransitiveClosureNode &>(node), ctx);
+		return renderTransitiveClosure(static_cast<const TransitiveClosureNode &>(node), ctx, nullptr);
 	}
 	return std::string();
 }

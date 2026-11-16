@@ -1,0 +1,49 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#>.
+@prefix ex: <http://example.com/ns#>.
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#>.
+
+# A small bill of materials, for transitive closures over raw keys.
+#
+# Both ends of ex:hasComponent are the same one-placeholder template over
+# INTEGER columns, so with a type catalog the closure recurses on the integer
+# keys and hands them to the join above it. The sales lines reference products
+# through the same template, and their amounts are DECIMAL, so an aggregate over
+# a closure-joined block can read the table value.
+
+<#Part>
+    rr:logicalTable [ rr:tableName "PART" ];
+    rr:subjectMap [
+        rr:template "http://data.example.com/part/{ID}";
+        rr:class ex:Part;
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:name;
+        rr:objectMap [ rr:column "NAME" ];
+    ].
+
+<#Bike>
+    rr:logicalTable [ rr:sqlQuery "SELECT ID FROM PART WHERE KIND = 'bike'" ];
+    rr:subjectMap [
+        rr:template "http://data.example.com/part/{ID}";
+        rr:class ex:Bike;
+    ].
+
+<#Bom>
+    rr:logicalTable [ rr:tableName "BOM" ];
+    rr:subjectMap [ rr:template "http://data.example.com/part/{ASSEMBLY}" ];
+    rr:predicateObjectMap [
+        rr:predicate ex:hasComponent;
+        rr:objectMap [ rr:template "http://data.example.com/part/{COMPONENT}" ];
+    ].
+
+<#Sale>
+    rr:logicalTable [ rr:tableName "SALE" ];
+    rr:subjectMap [ rr:template "http://data.example.com/sale/{LID}" ];
+    rr:predicateObjectMap [
+        rr:predicate ex:ofProduct;
+        rr:objectMap [ rr:template "http://data.example.com/part/{PID}" ];
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:amount;
+        rr:objectMap [ rr:column "AMOUNT"; rr:datatype xsd:decimal ];
+    ].

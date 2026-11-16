@@ -461,10 +461,33 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 	}
 	// Native companions for aggregates (see TranslationContext::setNativeRoot):
 	// only over a single SPJ block, whose columns still name the table values
-	// they were built from, and only where the catalog types the column.
+	// they were built from, and only where the catalog types the column. The
+	// block is the root itself, or one SPJ operand of an inner-join root (a
+	// scan joined to a property-path closure, say): renderJoin passes that
+	// operand's native columns up, and they are the values of the root's rows
+	// for every variable the join does not coalesce.
 	const bool grouping = !query.solutionModifier.groupBy.empty() || queryHasAggregate(query);
 	std::map<std::string, TranslationContext::NativeAggregateRef> nativeAggs;
-	if (grouping && rootNode->kind() == RelKind::Spj && ctx.catalog() != nullptr) {
+	if (grouping && ctx.catalog() != nullptr) {
+		std::vector<const RelNode *> blocks;
+		std::set<std::string> coalesced;
+		if (rootNode->kind() == RelKind::Spj) {
+			blocks.push_back(rootNode.get());
+		} else if (rootNode->kind() == RelKind::Join) {
+			const auto &join = static_cast<const JoinNode &>(*rootNode);
+			if (join.joinKind == JoinKind::Inner) {
+				for (const auto &k : join.keys) {
+					if (k.nullSafe) {
+						coalesced.insert(k.var);
+					}
+				}
+				for (const RelNode *child : {join.left.get(), join.right.get()}) {
+					if (child->kind() == RelKind::Spj) {
+						blocks.push_back(child);
+					}
+				}
+			}
+		}
 		std::set<std::string> aggVars;
 		for (const auto &item : query.selectItems) {
 			if (item.expr) {
@@ -475,38 +498,50 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 			collectAggregateVars(*h, aggVars);
 		}
 		const TypeCatalog &cat = *ctx.catalog();
-		std::map<std::string, std::string> exprs;
-		for (const auto &c : rootNode->schema()) {
-			if (aggVars.count(c.var) == 0) {
-				continue;
+		const RelNode *bestBlock = nullptr;
+		std::map<std::string, std::string> bestExprs;
+		std::map<std::string, TranslationContext::NativeAggregateRef> bestRefs;
+		for (const RelNode *block : blocks) {
+			std::map<std::string, std::string> exprs;
+			std::map<std::string, TranslationContext::NativeAggregateRef> refs;
+			for (const auto &c : block->schema()) {
+				if (aggVars.count(c.var) == 0 || coalesced.count(c.var) != 0) {
+					continue;
+				}
+				TranslationContext::NativeAggregateRef ref;
+				std::string expr;
+				if (c.prov == Provenance::PureColumn && !c.nativeColumnRef.empty() && !c.tableIdentity.empty()) {
+					expr = c.nativeColumnRef;
+					ref.numeric = cat.isNumericType(c.tableIdentity, c.columnName);
+					ref.integral = cat.isIntegerType(c.tableIdentity, c.columnName);
+					std::string type = cat.typeOf(c.tableIdentity, c.columnName);
+					std::transform(type.begin(), type.end(), type.begin(), ::toupper);
+					ref.exactDecimal = ref.integral || type.rfind("DECIMAL", 0) == 0 || type.rfind("NUMERIC", 0) == 0;
+					// Not floating point: -0.0 and 0.0 are one value but two lexical forms.
+					ref.countable = cat.isIntegerType(c.tableIdentity, c.columnName) ||
+					                cat.isStringType(c.tableIdentity, c.columnName);
+				} else if (c.prov == Provenance::TemplateExpr && c.templateInvertible &&
+				           c.templateColumnRefs.size() == 1 && !c.tableIdentity.empty()) {
+					// One placeholder and an invertible template: the IRI and its
+					// column value determine each other.
+					expr = c.templateColumnRefs[0];
+					ref.countable = cat.isIntegerType(c.tableIdentity, c.templateColumnNames[0]) ||
+					                cat.isStringType(c.tableIdentity, c.templateColumnNames[0]);
+				}
+				if (!expr.empty() && (ref.numeric || ref.countable)) {
+					exprs[c.var] = expr;
+					refs[c.var] = ref;
+				}
 			}
-			TranslationContext::NativeAggregateRef ref;
-			std::string expr;
-			if (c.prov == Provenance::PureColumn && !c.nativeColumnRef.empty() && !c.tableIdentity.empty()) {
-				expr = c.nativeColumnRef;
-				ref.numeric = cat.isNumericType(c.tableIdentity, c.columnName);
-				ref.integral = cat.isIntegerType(c.tableIdentity, c.columnName);
-				std::string type = cat.typeOf(c.tableIdentity, c.columnName);
-				std::transform(type.begin(), type.end(), type.begin(), ::toupper);
-				ref.exactDecimal = ref.integral || type.rfind("DECIMAL", 0) == 0 || type.rfind("NUMERIC", 0) == 0;
-				// Not floating point: -0.0 and 0.0 are one value but two lexical forms.
-				ref.countable =
-				    cat.isIntegerType(c.tableIdentity, c.columnName) || cat.isStringType(c.tableIdentity, c.columnName);
-			} else if (c.prov == Provenance::TemplateExpr && c.templateInvertible && c.templateColumnRefs.size() == 1 &&
-			           !c.tableIdentity.empty()) {
-				// One placeholder and an invertible template: the IRI and its
-				// column value determine each other.
-				expr = c.templateColumnRefs[0];
-				ref.countable = cat.isIntegerType(c.tableIdentity, c.templateColumnNames[0]) ||
-				                cat.isStringType(c.tableIdentity, c.templateColumnNames[0]);
-			}
-			if (!expr.empty() && (ref.numeric || ref.countable)) {
-				exprs[c.var] = expr;
-				nativeAggs[c.var] = ref;
+			if (exprs.size() > bestExprs.size()) {
+				bestBlock = block;
+				bestExprs = std::move(exprs);
+				bestRefs = std::move(refs);
 			}
 		}
-		if (!exprs.empty()) {
-			ctx.setNativeRoot(rootNode.get(), std::move(exprs));
+		if (bestBlock != nullptr) {
+			ctx.setNativeRoot(bestBlock, std::move(bestExprs));
+			nativeAggs = std::move(bestRefs);
 		}
 	}
 

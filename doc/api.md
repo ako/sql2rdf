@@ -618,7 +618,8 @@ failing the query. ASK and CONSTRUCT are not affected.
 
 **Native aggregates.** Aggregates normally work on the VARCHAR lexical form of each term, which for
 `SUM(?amount)` means casting the column to text and back. When the query's root relation is a single
-select-project-join block and a catalog is given, the translator asks the renderer for an `n_<var>`
+select-project-join block, or an inner join with one such block as an operand (a scan joined to a
+property-path closure, say), and a catalog is given, the translator asks the renderer for an `n_<var>`
 companion column: the uncast table value an aggregated variable was built from. `SUM`, `AVG`, `MIN` and
 `MAX` use it inside the same casts as before, but only where that gives the same result: any numeric
 column for `DOUBLE` arithmetic, an integer or `DECIMAL` column for fixed-point arithmetic, and an integer
@@ -1142,6 +1143,14 @@ one exception, handled by rewriting the query.
     **both endpoints unbound** (`?x :p+ ?y`) forces the expensive general case, a full `(subject,
     object)` pairs closure with no size/depth guard — this can be costly on a densely-connected
     graph, the same cost tradeoff `E?`'s both-unbound case already has above.
+    When `E` is one select-project-join block whose two endpoints are the same invertible
+    `rr:template` over type-comparable columns (the native-key conditions; needs a catalog), the
+    closure recurses on the template's placeholder columns instead of on IRI text: each hop is a key
+    join, the IRI rides along unchanged, and the closure exposes its keys so the join above it
+    compares keys too. Within a basic graph pattern, triple patterns that scan tables are joined
+    before closures and other derived-table operands (each one connected to what is already joined
+    where possible), so that scans of one table can merge into one block and lose their self-join
+    even when a closure is written between them.
 - **Named graphs / `GRAPH`**: supported. `rr:graph`/`rr:graphMap` on a subject map or a
   predicate-object map are read *in reverse*, exactly as the term maps for subject/predicate/object
   are: the graph becomes a fourth term position, so `GRAPH <iri>` prunes candidates whose graph map
