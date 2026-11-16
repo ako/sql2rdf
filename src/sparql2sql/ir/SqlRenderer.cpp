@@ -169,6 +169,13 @@ std::string renderSpj(const SpjRelation &rel, TranslationContext &ctx, const Ext
 				cols.push_back(e.second + " AS " + e.first);
 			}
 		}
+		if (ctx.nativeRoot() == &rel) {
+			// A function of a column already projected here, so it never changes
+			// what a DISTINCT on this block keeps.
+			for (const auto &n : ctx.nativeRootExprs()) {
+				cols.push_back(n.second + " AS " + mangleVarNative(n.first, dialect));
+			}
+		}
 		sql += joinColumnList(cols, ctx);
 	}
 	sql += ctx.clauseSep() + "FROM ";

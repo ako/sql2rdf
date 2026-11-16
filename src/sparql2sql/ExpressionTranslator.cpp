@@ -790,19 +790,41 @@ std::string translateAggregate(const AggregateExpr &agg, const TranslatedPattern
 	std::string distinctPrefix = agg.distinct ? "DISTINCT " : "";
 	const TermInfo argInfo = (agg.star || !agg.arg) ? TermInfo() : inferExprTermInfo(*agg.arg, scope);
 
+	// A bare variable may have a native companion column (the table value its
+	// lexical form was built from, see TranslationContext::setNativeRoot).
+	// Aggregating that skips building and re-parsing the text per row; the
+	// casts around it stay the same, so the result is the same.
+	const std::string argVar = (!agg.star && agg.arg && agg.arg->kind() == ExprKind::VarRef)
+	                               ? static_cast<const VarExpr &>(*agg.arg).var->name
+	                               : std::string();
+	const TranslationContext::NativeAggregateRef native =
+	    argVar.empty() ? TranslationContext::NativeAggregateRef() : ctx.nativeAggregateRef(argVar);
+	const std::string numArg = native.numeric ? native.ref : arg;      // for DOUBLE arithmetic
+	const std::string decArg = native.exactDecimal ? native.ref : arg; // for DECIMAL arithmetic
+	const std::string intArg = native.integral ? native.ref : arg;     // for BIGINT arithmetic
+
 	switch (agg.aggKind) {
 	case AggregateKind::Count:
+		// COUNT(?x) over a variable bound in every row counts rows. COUNT(*) lets
+		// the engine skip building the term at all.
+		if (!agg.distinct && !argVar.empty() && scope.boundVars.count(argVar) != 0 &&
+		    scope.optionalVars.count(argVar) == 0) {
+			return "CAST(COUNT(*) AS VARCHAR)";
+		}
+		if (agg.distinct && native.countable) {
+			return "CAST(COUNT(DISTINCT " + native.ref + ") AS VARCHAR)";
+		}
 		return "CAST(COUNT(" + distinctPrefix + arg + ") AS VARCHAR)";
 	case AggregateKind::Sum:
 		// Integral in, integral out, matching arithmetic() - otherwise SUM over
 		// an xsd:integer column would render "30.0".
 		if (argInfo.isIntegral()) {
-			return "CAST(SUM(" + distinctPrefix + dialect.tryCastToBigInt(arg) + ") AS VARCHAR)";
+			return "CAST(SUM(" + distinctPrefix + dialect.tryCastToBigInt(intArg) + ") AS VARCHAR)";
 		}
 		// xsd:decimal stays fixed-point: a DOUBLE sum turns money totals such as
 		// 0.10 + 0.20 into "0.30000000000000004".
 		if (argInfo.datatypeIri == xsd::kDecimal) {
-			return dialect.decimalToLexical("SUM(" + distinctPrefix + dialect.tryCastToDecimal(arg) + ")");
+			return dialect.decimalToLexical("SUM(" + distinctPrefix + dialect.tryCastToDecimal(decArg) + ")");
 		}
 		// The mapping does not settle the type - typically because a generic
 		// triple map (predicate from a column) is a candidate beside a typed
@@ -820,9 +842,9 @@ std::string translateAggregate(const AggregateExpr &agg, const TranslatedPattern
 				       " ELSE CAST(SUM(" + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR) END)";
 			}
 		}
-		return "CAST(SUM(" + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR)";
+		return "CAST(SUM(" + distinctPrefix + dialect.tryCastToDouble(numArg) + ") AS VARCHAR)";
 	case AggregateKind::Avg:
-		return "CAST(AVG(" + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR)";
+		return "CAST(AVG(" + distinctPrefix + dialect.tryCastToDouble(numArg) + ") AS VARCHAR)";
 	case AggregateKind::Min:
 	case AggregateKind::Max: {
 		// Aggregate in the argument's static type when the mapping declares one;
@@ -836,13 +858,13 @@ std::string translateAggregate(const AggregateExpr &agg, const TranslatedPattern
 		// produces - see doc/api.md.
 		const std::string fn = (agg.aggKind == AggregateKind::Min) ? "MIN(" : "MAX(";
 		if (argInfo.isIntegral()) {
-			return "CAST(" + fn + distinctPrefix + dialect.tryCastToBigInt(arg) + ") AS VARCHAR)";
+			return "CAST(" + fn + distinctPrefix + dialect.tryCastToBigInt(intArg) + ") AS VARCHAR)";
 		}
 		if (argInfo.datatypeIri == xsd::kDecimal) {
-			return dialect.decimalToLexical(fn + distinctPrefix + dialect.tryCastToDecimal(arg) + ")");
+			return dialect.decimalToLexical(fn + distinctPrefix + dialect.tryCastToDecimal(decArg) + ")");
 		}
 		if (argInfo.isNumeric()) {
-			return "CAST(" + fn + distinctPrefix + dialect.tryCastToDouble(arg) + ") AS VARCHAR)";
+			return "CAST(" + fn + distinctPrefix + dialect.tryCastToDouble(numArg) + ") AS VARCHAR)";
 		}
 		if (argInfo.datatypeIri == xsd::kDate) {
 			return "CAST(" + fn + distinctPrefix + dialect.tryCastToDate(arg) + ") AS VARCHAR)";

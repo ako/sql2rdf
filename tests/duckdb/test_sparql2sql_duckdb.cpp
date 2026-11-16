@@ -2304,6 +2304,113 @@ TEST_CASE("term tags: unbound OPTIONAL variables have NULL tags") {
 }
 
 // ---------------------------------------------------------------------------
+// Native aggregates: with a type catalog, SUM/AVG/MIN/MAX/COUNT read the table
+// value (an n_<var> companion column) instead of re-parsing each term's text,
+// and COUNT(?x) over an always-bound variable becomes COUNT(*). Every query
+// must return exactly what the text path returns (no catalog).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::unique_ptr<DuckDBConnection> makeAggregateDatabase() {
+	auto conn = std::make_unique<DuckDBConnection>(":memory:");
+	conn->execute("CREATE TABLE AGG_ROWS (ID INTEGER, QTY INTEGER, PRICE DECIMAL(10,2), RATE DOUBLE, CODE VARCHAR, "
+	              "OWNER INTEGER)");
+	// Row 1 appears twice: the graph is a set, so it must count once.
+	conn->execute("INSERT INTO AGG_ROWS VALUES (1, 2, 0.10, 0.1, 'a', 1), (1, 2, 0.10, 0.1, 'a', 1), "
+	              "(2, 3, 0.20, 0.2, 'b', 1), (3, 5, 0.30, 0.7, 'a', 2), (4, NULL, NULL, NULL, NULL, NULL)");
+	return conn;
+}
+
+struct AggRun {
+	std::string sql;
+	std::vector<std::map<std::string, std::string>> rows;
+};
+
+AggRun runAggregate(DuckDBConnection &conn, const std::string &body, bool withCatalog) {
+	Parser parser;
+	auto query = parser.parseString("PREFIX ex: <http://example.com/ns#>\n" + body);
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_native_aggregates.ttl");
+	sparql2sql::TypeCatalog cat;
+	if (withCatalog) {
+		sql2rdf::loadTypeCatalog(conn, &mapping, cat);
+	}
+	DuckDbDialect dialect;
+	AggRun run;
+	run.sql = translateQuery(*query, mapping, dialect, withCatalog ? &cat : nullptr, sparql2sql::TranslateOptions());
+	run.rows = collectRows(*conn.execute(run.sql));
+	return run;
+}
+
+// Native and text paths agree; returns the native run.
+AggRun bothPaths(DuckDBConnection &conn, const std::string &body) {
+	AggRun native = runAggregate(conn, body, true);
+	AggRun text = runAggregate(conn, body, false);
+	INFO("native SQL: " << native.sql);
+	INFO("text SQL: " << text.sql);
+	CHECK(native.rows == text.rows);
+	return native;
+}
+
+} // namespace
+
+TEST_CASE("native aggregates: integer column, every aggregate") {
+	auto conn = makeAggregateDatabase();
+	auto r = bothPaths(*conn, "SELECT (SUM(?q) AS ?s) (AVG(?q) AS ?a) (MIN(?q) AS ?mn) (MAX(?q) AS ?mx) "
+	                          "(COUNT(?q) AS ?n) WHERE { ?m ex:qty ?q }");
+	REQUIRE(r.rows.size() == 1);
+	CHECK(r.rows[0].at("V_S") == "10");
+	CHECK(r.rows[0].at("V_MN") == "2");
+	CHECK(r.rows[0].at("V_MX") == "5");
+	CHECK(r.rows[0].at("V_N") == "3"); // the duplicate row counts once, the NULL row not at all
+	CHECK(r.sql.find("AS \"n_q\"") != std::string::npos);
+	CHECK(r.sql.find("COUNT(*)") != std::string::npos);
+}
+
+TEST_CASE("native aggregates: decimals stay exact, a DOUBLE column declared decimal stays on text") {
+	auto conn = makeAggregateDatabase();
+	auto price = bothPaths(*conn, "SELECT (SUM(?p) AS ?s) WHERE { ?m ex:price ?p }");
+	REQUIRE(price.rows.size() == 1);
+	CHECK(price.rows[0].at("V_S") == "0.6");
+	CHECK(price.sql.find("\"n_p\"") != std::string::npos);
+	// RATE is DOUBLE: summing it as DECIMAL from the native value would give
+	// 0.1000000000000000055... per row, so the decimal sum must read the text.
+	auto rate = bothPaths(*conn, "SELECT (SUM(?r) AS ?s) WHERE { ?m ex:rate ?r }");
+	REQUIRE(rate.rows.size() == 1);
+	CHECK(rate.rows[0].at("V_S") == "1");
+	CHECK(rate.sql.find("SUM(TRY_CAST(t") != std::string::npos);
+	// The same column declared xsd:double does go native.
+	auto dbl = bothPaths(*conn, "SELECT (SUM(?r) AS ?s) WHERE { ?m ex:ratedbl ?r }");
+	CHECK(dbl.sql.find(".\"n_r\"") != std::string::npos);
+}
+
+TEST_CASE("native aggregates: COUNT(DISTINCT) over a text column and over a one-placeholder IRI") {
+	auto conn = makeAggregateDatabase();
+	auto codes = bothPaths(*conn, "SELECT (COUNT(DISTINCT ?c) AS ?n) WHERE { ?m ex:code ?c }");
+	REQUIRE(codes.rows.size() == 1);
+	CHECK(codes.rows[0].at("V_N") == "2");
+	CHECK(codes.sql.find("COUNT(DISTINCT t") != std::string::npos);
+	auto owners = bothPaths(*conn, "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?m ex:owner ?o }");
+	REQUIRE(owners.rows.size() == 1);
+	CHECK(owners.rows[0].at("V_N") == "2");
+	CHECK(owners.sql.find("\"n_o\"") != std::string::npos);
+}
+
+TEST_CASE("native aggregates: grouped, and an OPTIONAL variable keeps COUNT(?x)") {
+	auto conn = makeAggregateDatabase();
+	auto grouped = bothPaths(*conn, "SELECT ?c (SUM(?q) AS ?s) (COUNT(?m) AS ?n) WHERE { ?m ex:code ?c ; ex:qty ?q } "
+	                                "GROUP BY ?c ORDER BY ?c");
+	REQUIRE(grouped.rows.size() == 2);
+	CHECK(grouped.rows[0].at("V_S") == "7");
+	CHECK(grouped.rows[1].at("V_S") == "3");
+	auto optional = bothPaths(*conn, "SELECT (COUNT(?q) AS ?n) WHERE { ?m ex:owner ?o OPTIONAL { ?m ex:qty ?q } }");
+	REQUIRE(optional.rows.size() == 1);
+	CHECK(optional.rows[0].at("V_N") == "3");
+	CHECK(optional.sql.find("COUNT(*)") == std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
 // Reasoning by mapping saturation (Ontology.h): answers include what the class
 // and property hierarchies imply, each resource once.
 // ---------------------------------------------------------------------------

@@ -1,0 +1,32 @@
+@prefix rr:  <http://www.w3.org/ns/r2rml#> .
+@prefix ex:  <http://example.com/ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Native aggregates: SUM/AVG/MIN/MAX/COUNT read the table value instead of
+# re-parsing the term's text, where that gives the same answer. One column per
+# case, over table AGG_ROWS (ID INTEGER, QTY INTEGER, PRICE DECIMAL(10,2),
+# RATE DOUBLE, CODE VARCHAR, OWNER INTEGER):
+#
+#   ex:qty      xsd:integer over an INTEGER column  - native for every cast
+#   ex:price    xsd:decimal over a DECIMAL column    - native, still exact
+#   ex:rate     xsd:decimal over a DOUBLE column     - must NOT go native for the
+#                                                      decimal sum (a DOUBLE 0.1
+#                                                      is not the decimal 0.1)
+#   ex:ratedbl  xsd:double over the same column      - native for DOUBLE
+#   ex:code     a plain literal over VARCHAR         - COUNT(DISTINCT) native
+#   ex:owner    an IRI from one INTEGER placeholder  - COUNT(DISTINCT) native
+<#Row>
+    rr:logicalTable [ rr:tableName "AGG_ROWS" ];
+    rr:subjectMap [ rr:template "http://ex.org/row/{ID}" ];
+    rr:predicateObjectMap [ rr:predicate ex:qty;
+        rr:objectMap [ rr:column "QTY"; rr:datatype xsd:integer ] ];
+    rr:predicateObjectMap [ rr:predicate ex:price;
+        rr:objectMap [ rr:column "PRICE"; rr:datatype xsd:decimal ] ];
+    rr:predicateObjectMap [ rr:predicate ex:rate;
+        rr:objectMap [ rr:column "RATE"; rr:datatype xsd:decimal ] ];
+    rr:predicateObjectMap [ rr:predicate ex:ratedbl;
+        rr:objectMap [ rr:column "RATE"; rr:datatype xsd:double ] ];
+    rr:predicateObjectMap [ rr:predicate ex:code;
+        rr:objectMap [ rr:column "CODE" ] ];
+    rr:predicateObjectMap [ rr:predicate ex:owner;
+        rr:objectMap [ rr:template "http://ex.org/owner/{OWNER}" ] ].

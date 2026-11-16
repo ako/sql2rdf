@@ -601,6 +601,18 @@ Aggregates are typed by their result datatype, so `COUNT` and an integral `SUM` 
 cast is a `TRY_CAST`, so a value that does not fit its declared datatype becomes NULL instead of
 failing the query. ASK and CONSTRUCT are not affected.
 
+**Native aggregates.** Aggregates normally work on the VARCHAR lexical form of each term, which for
+`SUM(?amount)` means casting the column to text and back. When the query's root relation is a single
+select-project-join block and a catalog is given, the translator asks the renderer for an `n_<var>`
+companion column: the uncast table value an aggregated variable was built from. `SUM`, `AVG`, `MIN` and
+`MAX` use it inside the same casts as before, but only where that gives the same result: any numeric
+column for `DOUBLE` arithmetic, an integer or `DECIMAL` column for fixed-point arithmetic, and an integer
+column for `BIGINT` arithmetic (a `DOUBLE` column declared `xsd:decimal` keeps the text path, because a
+binary 0.1 is not the decimal 0.1). `COUNT(DISTINCT ?x)` uses it for integer and string columns and for
+IRIs built from one such column by an invertible template. Independently of the catalog, `COUNT(?x)` over
+a variable bound in every row becomes `COUNT(*)`, so the engine never builds the term. Results are
+identical to the text path; `tests/duckdb` checks every case both ways.
+
 **Term tags.** A SELECT column holds only the term's lexical form, so `<http://x>` and `"http://x"`
 look the same. With `TranslateOptions::termTags`, each output column `v_<var>` is followed by a
 VARCHAR column `d_<var>` with the term's tag, in `encodeTag`'s encoding:

@@ -90,6 +90,49 @@ bool containsAggregate(const Expression &expr) {
 	return false;
 }
 
+// The variables that appear bare as an aggregate's argument, e.g. ?amt in
+// SUM(?amt): the only ones a native companion column can serve.
+void collectAggregateVars(const Expression &expr, std::set<std::string> &out) {
+	switch (expr.kind()) {
+	case ExprKind::Aggregate: {
+		const auto &agg = static_cast<const sparql::ast::AggregateExpr &>(expr);
+		if (!agg.star && agg.arg && agg.arg->kind() == ExprKind::VarRef) {
+			out.insert(static_cast<const VarExpr &>(*agg.arg).var->name);
+		}
+		return;
+	}
+	case ExprKind::Unary:
+		collectAggregateVars(*static_cast<const UnaryExpr &>(expr).operand, out);
+		return;
+	case ExprKind::Binary: {
+		const auto &b = static_cast<const BinaryExpr &>(expr);
+		collectAggregateVars(*b.left, out);
+		collectAggregateVars(*b.right, out);
+		return;
+	}
+	case ExprKind::In: {
+		const auto &in = static_cast<const InExpr &>(expr);
+		collectAggregateVars(*in.lhs, out);
+		for (const auto &e : in.list) {
+			collectAggregateVars(*e, out);
+		}
+		return;
+	}
+	case ExprKind::FunctionCall:
+		for (const auto &a : static_cast<const FunctionCallExpr &>(expr).args) {
+			collectAggregateVars(*a, out);
+		}
+		return;
+	case ExprKind::BuiltInCall:
+		for (const auto &a : static_cast<const BuiltInCallExpr &>(expr).args) {
+			collectAggregateVars(*a, out);
+		}
+		return;
+	default:
+		return;
+	}
+}
+
 bool queryHasAggregate(const Query &query) {
 	for (const auto &item : query.selectItems) {
 		if (item.expr && containsAggregate(*item.expr)) {
@@ -416,15 +459,69 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 			}
 		}
 	}
+	// Native companions for aggregates (see TranslationContext::setNativeRoot):
+	// only over a single SPJ block, whose columns still name the table values
+	// they were built from, and only where the catalog types the column.
+	const bool grouping = !query.solutionModifier.groupBy.empty() || queryHasAggregate(query);
+	std::map<std::string, TranslationContext::NativeAggregateRef> nativeAggs;
+	if (grouping && rootNode->kind() == RelKind::Spj && ctx.catalog() != nullptr) {
+		std::set<std::string> aggVars;
+		for (const auto &item : query.selectItems) {
+			if (item.expr) {
+				collectAggregateVars(*item.expr, aggVars);
+			}
+		}
+		for (const auto &h : query.solutionModifier.having) {
+			collectAggregateVars(*h, aggVars);
+		}
+		const TypeCatalog &cat = *ctx.catalog();
+		std::map<std::string, std::string> exprs;
+		for (const auto &c : rootNode->schema()) {
+			if (aggVars.count(c.var) == 0) {
+				continue;
+			}
+			TranslationContext::NativeAggregateRef ref;
+			std::string expr;
+			if (c.prov == Provenance::PureColumn && !c.nativeColumnRef.empty() && !c.tableIdentity.empty()) {
+				expr = c.nativeColumnRef;
+				ref.numeric = cat.isNumericType(c.tableIdentity, c.columnName);
+				ref.integral = cat.isIntegerType(c.tableIdentity, c.columnName);
+				std::string type = cat.typeOf(c.tableIdentity, c.columnName);
+				std::transform(type.begin(), type.end(), type.begin(), ::toupper);
+				ref.exactDecimal = ref.integral || type.rfind("DECIMAL", 0) == 0 || type.rfind("NUMERIC", 0) == 0;
+				// Not floating point: -0.0 and 0.0 are one value but two lexical forms.
+				ref.countable =
+				    cat.isIntegerType(c.tableIdentity, c.columnName) || cat.isStringType(c.tableIdentity, c.columnName);
+			} else if (c.prov == Provenance::TemplateExpr && c.templateInvertible && c.templateColumnRefs.size() == 1 &&
+			           !c.tableIdentity.empty()) {
+				// One placeholder and an invertible template: the IRI and its
+				// column value determine each other.
+				expr = c.templateColumnRefs[0];
+				ref.countable = cat.isIntegerType(c.tableIdentity, c.templateColumnNames[0]) ||
+				                cat.isStringType(c.tableIdentity, c.templateColumnNames[0]);
+			}
+			if (!expr.empty() && (ref.numeric || ref.countable)) {
+				exprs[c.var] = expr;
+				nativeAggs[c.var] = ref;
+			}
+		}
+		if (!exprs.empty()) {
+			ctx.setNativeRoot(rootNode.get(), std::move(exprs));
+		}
+	}
+
 	TranslatedPattern source;
 	{
 		TranslationContext::SubqueryDepthGuard depthGuard(ctx);
 		source = renderRelation(*rootNode, ctx);
 	}
+	ctx.setNativeRoot(nullptr, {});
 
 	std::string alias = ctx.nextAlias();
-
-	bool grouping = !query.solutionModifier.groupBy.empty() || queryHasAggregate(query);
+	for (auto &n : nativeAggs) {
+		n.second.ref = alias + "." + mangleVarNative(n.first, dialect);
+	}
+	ctx.setNativeAggregateRefs(std::move(nativeAggs));
 	GroupByBuild groupBy = buildGroupBy(query, source, alias, ctx);
 
 	std::set<std::string> groupByAliases = groupByAliasNames(query);
@@ -589,6 +686,7 @@ TranslatedPattern translateQueryPattern(const sparql::ast::Query &query, Transla
 			}
 		}
 	}
+	ctx.setNativeAggregateRefs({});
 	return result;
 }
 
