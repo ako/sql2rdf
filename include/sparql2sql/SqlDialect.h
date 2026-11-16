@@ -94,6 +94,13 @@ public:
 	/// Render a SAMPLE-style "pick any one value" aggregate.
 	virtual std::string anyValueAgg(const std::string &expr) const = 0;
 
+	/// Render an aggregate returning `value` from the row where `key` is
+	/// smallest (`max` false) or largest (`max` true), ignoring rows whose key
+	/// is NULL. SPARQL's MIN/MAX return one of the input terms unchanged, so a
+	/// typed MIN/MAX compares the typed key but returns the row's own lexical
+	/// form ("78.8900", not the engine's canonical "78.89").
+	virtual std::string argExtremeAgg(bool max, const std::string &value, const std::string &key) const = 0;
+
 	/// A boolean expression that is true for a negative floating-point value,
 	/// -0.0 included: deduplicating raw DOUBLE values together with it keeps
 	/// -0.0 and 0.0 apart, as their lexical forms are. Empty (the default) when

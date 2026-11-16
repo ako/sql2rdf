@@ -1325,18 +1325,22 @@ one exception, handled by rewriting the query.
     row is integral, fixed-point when the rows are integers and `xsd:decimal`s, and `DOUBLE` when any
     row is `xsd:double`/`xsd:float` or an untyped literal that reads as a number. Rows that are not
     numeric (IRIs, strings, untyped text such as `"n/a"`) are skipped and do not change the type.
-  - `SUM()`, `MIN()` and `MAX()` over a statically `xsd:decimal` argument stay fixed-point: they
-    aggregate `TRY_CAST(... AS DECIMAL(38,18))` and render the result in canonical decimal form
-    (trailing fractional zeros and a trailing point removed), so `0.10 + 0.20` renders `"0.3"`
-    rather than the `DOUBLE` sum `"0.30000000000000004"`. `AVG()` still goes through `DOUBLE`.
+  - `SUM()` over a statically `xsd:decimal` argument stays fixed-point: it aggregates
+    `TRY_CAST(... AS DECIMAL(38,18))` and renders the new value in canonical decimal form (trailing
+    fractional zeros and a trailing point removed), so `0.10 + 0.20` renders `"0.3"` rather than the
+    `DOUBLE` sum `"0.30000000000000004"`. `AVG()` still goes through `DOUBLE`.
+  - A typed `MIN()`/`MAX()` (integer, decimal, other numeric, date, dateTime) compares in the
+    argument's static type but returns the winning row's **own term** (`arg_min`/`arg_max` of the
+    lexical form by the typed value), as SPARQL 1.1 §18.5.1 defines them: one of the input values.
+    `MAX` over `"78.8900"^^xsd:decimal` is `"78.8900"`, so a join or `FILTER(?price = ?max)` against
+    the result finds its row again; a canonical `"78.89"` would be a different term and match
+    nothing. Equal values with different lexical forms (`"1.0"`, `"1.00"`) return either.
   - `ORDER BY` sorts **in the key's static type** when it is known numeric or temporal, and
     lexicographically otherwise. When the key's dimension varies per row the single key expands into
     SPARQL §15.1's own layered order: term kind first (unbound < blank node < IRI < literal), then
     value space so comparable literals sort together, then the value read as each orderable type,
-    then the raw lexical form. Three caveats: a value failing the `TRY_CAST` sorts as `NULL` (last,
-    for `ASC`) rather than raising; a typed `MIN()`/`MAX()` returns the SQL engine's canonical
-    rendering of the value, so `MIN()` over `xsd:integer` values `"007"` and `"42"` returns `"7"`, not
-    `"007"`; and an `ORDER BY` key that exists only as a SELECT-list alias (e.g. `ORDER BY ?cnt` over
+    then the raw lexical form. Two caveats: a value failing the `TRY_CAST` sorts as `NULL` (last,
+    for `ASC`) rather than raising; and an `ORDER BY` key that exists only as a SELECT-list alias (e.g. `ORDER BY ?cnt` over
     `(COUNT(?x) AS ?cnt)`) is typed from the expression that defines it, which reaches only the
     single-key path.
   - A bare `GROUP BY ?x` partitions by RDF *term*, so it includes `?x`'s tag as a second grouping key
