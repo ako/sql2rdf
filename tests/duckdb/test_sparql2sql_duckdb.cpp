@@ -2708,3 +2708,102 @@ TEST_CASE("MAX in a subquery joins back to the row that holds it") {
 	                      mapping, nullptr);
 	CHECK(rows.size() == 1);
 }
+
+namespace {
+
+// A bill of materials for the raw-key closure: two bikes sharing a wheel, a
+// three-level chain under the wheel, a frame in one bike only, and a two-node
+// cycle that must still terminate when the recursion joins on keys.
+std::unique_ptr<DuckDBConnection> makeBomDatabase() {
+	std::unique_ptr<DuckDBConnection> conn(new DuckDBConnection(":memory:"));
+	conn->execute("CREATE TABLE PART (ID INTEGER, NAME VARCHAR, KIND VARCHAR)");
+	conn->execute("INSERT INTO PART VALUES (1, 'Bike A', 'bike'), (2, 'Bike B', 'bike'), (10, 'Wheel', NULL), "
+	              "(11, 'Hub', NULL), (12, 'Spoke', NULL), (20, 'Frame', NULL), (30, 'Loop A', NULL), "
+	              "(31, 'Loop B', NULL)");
+	conn->execute("CREATE TABLE BOM (ASSEMBLY INTEGER, COMPONENT INTEGER)");
+	conn->execute("INSERT INTO BOM VALUES (1, 10), (1, 20), (2, 10), (10, 11), (11, 12), (30, 31), (31, 30)");
+	conn->execute("CREATE TABLE SALE (LID INTEGER, PID INTEGER, AMOUNT DECIMAL(10,2))");
+	conn->execute("INSERT INTO SALE VALUES (100, 1, 10.50), (101, 1, 4.50), (102, 2, 7.25), (103, 20, 99.00)");
+	return conn;
+}
+
+std::string translateBom(const std::string &queryText, const R2RMLMapping &mapping,
+                         const sparql2sql::TypeCatalog *catalog) {
+	Parser parser;
+	DuckDbDialect dialect;
+	return translateQuery(*parser.parseString(queryText), mapping, dialect, catalog);
+}
+
+} // namespace
+
+TEST_CASE("closure over raw keys: every path shape answers as the IRI-string closure does") {
+	auto conn = makeBomDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_bom.ttl");
+	REQUIRE(mapping.isValid());
+	sparql2sql::TypeCatalog cat;
+	sql2rdf::loadTypeCatalog(*conn, &mapping, cat);
+
+	const std::string prefix = "PREFIX ex: <http://example.com/ns#>\nPREFIX p: <http://data.example.com/part/>\n";
+	const std::vector<std::string> queries = {
+	    "SELECT ?c WHERE { p:1 ex:hasComponent+ ?c }",
+	    "SELECT ?a WHERE { ?a ex:hasComponent+ p:12 }",
+	    "SELECT ?a ?c WHERE { ?a ex:hasComponent+ ?c }",
+	    "SELECT ?x WHERE { ?x ex:hasComponent+ ?x }",
+	    "ASK { p:2 ex:hasComponent+ p:12 }",
+	    "ASK { p:2 ex:hasComponent+ p:20 }",
+	    "SELECT ?c WHERE { p:30 ex:hasComponent* ?c }",
+	    "SELECT ?b ?n WHERE { ?b a ex:Bike ; ex:hasComponent+ ?c . ?c ex:name ?n }",
+	    "SELECT (SUM(?t) AS ?revenue) WHERE { ?b a ex:Bike ; ex:hasComponent+ p:12 . "
+	    "?line ex:ofProduct ?b ; ex:amount ?t }",
+	    "SELECT ?b (COUNT(DISTINCT ?c) AS ?n) WHERE { ?b a ex:Bike ; ex:hasComponent+ ?c } GROUP BY ?b",
+	};
+	for (const auto &q : queries) {
+		INFO("query: " << q);
+		auto withKeys = sorted(runWithCatalog(*conn, prefix + q, mapping, &cat));
+		auto withText = sorted(runWithCatalog(*conn, prefix + q, mapping, nullptr));
+		CHECK(withKeys == withText);
+	}
+
+	// The shapes that matter, with their actual answers.
+	auto parts = runWithCatalog(*conn, prefix + "SELECT ?c WHERE { p:1 ex:hasComponent+ ?c }", mapping, &cat);
+	CHECK(parts.size() == 4); // wheel, hub, spoke, frame
+	auto loop = runWithCatalog(*conn, prefix + "SELECT ?x WHERE { ?x ex:hasComponent+ ?x }", mapping, &cat);
+	CHECK(loop.size() == 2); // 30 and 31, around the cycle
+	auto revenue =
+	    runWithCatalog(*conn,
+	                   prefix + "SELECT (SUM(?t) AS ?revenue) WHERE { ?b a ex:Bike ; ex:hasComponent+ p:12 . "
+	                            "?line ex:ofProduct ?b ; ex:amount ?t }",
+	                   mapping, &cat);
+	REQUIRE(revenue.size() == 1);
+	CHECK(revenue[0].at("V_REVENUE") == "22.25");
+}
+
+TEST_CASE("closure over raw keys: the recursion, the join above it and the aggregate read table values") {
+	auto conn = makeBomDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_bom.ttl");
+	REQUIRE(mapping.isValid());
+	sparql2sql::TypeCatalog cat;
+	sql2rdf::loadTypeCatalog(*conn, &mapping, cat);
+
+	const std::string revenue = "PREFIX ex: <http://example.com/ns#>\nPREFIX p: <http://data.example.com/part/>\n"
+	                            "SELECT (SUM(?t) AS ?revenue) WHERE { ?b a ex:Bike ; ex:hasComponent+ p:12 . "
+	                            "?line ex:ofProduct ?b ; ex:amount ?t }";
+	const std::string sql = translateBom(revenue, mapping, &cat);
+	INFO("SQL: " << sql);
+	// Each hop joins integer keys, not IRI text.
+	CHECK(sql.find("\"cte_k0\" = ") != std::string::npos);
+	// The closure hands its key to the join with the bike/sales block.
+	CHECK(sql.find("AS \"k_0\"") != std::string::npos);
+	// The closure is joined last, so both sales patterns merge into one block
+	// and the self-join on SALE is gone.
+	CHECK(sql.find("\"SALE\"") == sql.rfind("\"SALE\""));
+	// SUM reads the DECIMAL column (its n_ companion) rather than the term text.
+	CHECK(sql.find("SUM(TRY_CAST(t") != std::string::npos);
+	CHECK(sql.find("\"n_t\" AS DECIMAL") != std::string::npos);
+
+	// Without a catalog nothing proves the key types comparable: IRI text, as before.
+	const std::string plain = translateBom(revenue, mapping, nullptr);
+	CHECK(plain.find("cte_k0") == std::string::npos);
+}

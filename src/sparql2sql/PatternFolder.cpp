@@ -178,6 +178,63 @@ RelNodePtr translateInlineData(const sparql::ast::InlineData &values, Translatio
 	return node;
 }
 
+// A pattern the optimizer can flatten into one SPJ block with its neighbours:
+// a triple pattern's scan (or its union of candidate scans). Anything else - a
+// property-path closure, a sequence path's join - is a derived-table boundary.
+bool isFlattenable(const RelNode &node) {
+	return node.kind() == RelKind::Spj || node.kind() == RelKind::UnionByName;
+}
+
+bool sharesVariable(const RelNode &node, const std::set<std::string> &vars) {
+	for (const auto &c : node.schema()) {
+		if (vars.count(c.var) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The order to join one basic graph pattern's translated triple patterns in.
+// A BGP's patterns are an inner join, so any order is the same answer; the
+// order matters to the optimizer, which only merges two *adjacent* flattenable
+// operands (mergeInner) and only eliminates a self-join inside one merged block.
+// Written order puts a closure between two scans of one table as often as not
+// (`?b :hasComponent+ :x . ?line :ofProduct ?b ; :lineTotal ?t`), which leaves
+// both scans in separate blocks. So: flattenable patterns first, each one
+// connected to what is already joined when one is, closures and other
+// boundaries after them; written order breaks every tie. A pattern sharing no
+// variable with the rest is taken only once nothing connected remains, so no
+// cross join appears that the written order did not have.
+std::vector<RelNodePtr> orderBgpJoins(std::vector<RelNodePtr> patterns, const RelNode &start) {
+	std::set<std::string> joined;
+	for (const auto &c : start.schema()) {
+		joined.insert(c.var);
+	}
+	std::vector<RelNodePtr> ordered;
+	ordered.reserve(patterns.size());
+	while (!patterns.empty()) {
+		std::size_t pick = patterns.size();
+		for (int pass = 0; pass < 2 && pick == patterns.size(); ++pass) {
+			for (std::size_t i = 0; i < patterns.size(); ++i) {
+				bool connected = joined.empty() || sharesVariable(*patterns[i], joined);
+				if (connected && (pass == 1 || isFlattenable(*patterns[i]))) {
+					pick = i;
+					break;
+				}
+			}
+		}
+		if (pick == patterns.size()) {
+			pick = 0; // Nothing connects: a cross join the written order has too.
+		}
+		for (const auto &c : patterns[pick]->schema()) {
+			joined.insert(c.var);
+		}
+		ordered.push_back(std::move(patterns[pick]));
+		patterns.erase(patterns.begin() + static_cast<std::ptrdiff_t>(pick));
+	}
+	return ordered;
+}
+
 RelNodePtr innerJoin(RelNodePtr left, RelNodePtr right, [[maybe_unused]] TranslationContext &ctx) {
 	if (left->kind() == RelKind::SingleRow) {
 		return right;
@@ -346,8 +403,13 @@ RelNodePtr fold(const sparql::ast::GroupGraphPattern &pattern, TranslationContex
 		switch (el.kind()) {
 		case ElementKind::BasicGraphPattern: {
 			const auto &bgp = static_cast<const BasicGraphPattern &>(el);
+			std::vector<RelNodePtr> patterns;
+			patterns.reserve(bgp.triples.size());
 			for (const auto &tp : bgp.triples) {
-				acc = innerJoin(std::move(acc), translateTriplePattern(tp, ctx), ctx);
+				patterns.push_back(translateTriplePattern(tp, ctx));
+			}
+			for (auto &p : orderBgpJoins(std::move(patterns), *acc)) {
+				acc = innerJoin(std::move(acc), std::move(p), ctx);
 			}
 			break;
 		}

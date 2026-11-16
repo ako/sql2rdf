@@ -389,3 +389,22 @@ TEST_CASE("translatePath: the closure's diagonal is driven by sameEndpointVar, n
 	CHECK(twoTc.mode == sparql2sql::TransitiveClosureNode::Mode::BothVars);
 	CHECK_FALSE(twoTc.sameEndpointVar);
 }
+
+TEST_CASE("a basic graph pattern joins its scans before a closure, whatever the written order") {
+	// The closure is written between the two patterns on ?line; joined in
+	// written order it would sit between them and keep them in separate SQL
+	// blocks. Joined last, they merge into one block over SALE (a self-join on
+	// the same subject), and the closure joins that block once.
+	R2RMLMapping mapping = parseMapping("sparql2sql_bom.ttl");
+	DuckDbDialect dialect;
+	Parser parser;
+	auto q = parser.parseString("PREFIX ex: <http://example.com/ns#>\n"
+	                            "PREFIX p: <http://data.example.com/part/>\n"
+	                            "SELECT ?t WHERE { ?line ex:ofProduct ?b . ?b ex:hasComponent+ p:12 . "
+	                            "?line ex:amount ?t }");
+	std::string sql = translateQuery(*q, mapping, dialect);
+	INFO(sql);
+	// The outermost relation is a two-way join: one merged block, one closure.
+	CHECK(sql.find("INNER JOIN") == sql.rfind("INNER JOIN"));
+	CHECK(contains(sql, "cte_node"));
+}
