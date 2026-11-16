@@ -112,3 +112,114 @@ TEST_CASE("saturateMapping: a superclass query reaches the subclass maps", "[spa
 	                                                                        "SELECT ?x WHERE { ?x a ex:Person }"),
 	                                          saturated));
 }
+
+namespace {
+
+const std::string kRdfs = "http://www.w3.org/2000/01/rdf-schema#";
+const std::string kOwl = "http://www.w3.org/2002/07/owl#";
+const std::string kType = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+// The ontology the DuckDB "reasoning: ..." cases use with sparql2sql_owl.ttl.
+Ontology owlOntology() {
+	Ontology o;
+	o.addTriple(kEx + "worksIn", kRdfs + "domain", kEx + "Worker");
+	o.addTriple(kEx + "Worker", kSubClassOf, kEx + "Agent");
+	o.addTriple(kEx + "worksIn", kRdfs + "range", kEx + "Unit");
+	o.addTriple(kEx + "memberOf", kRdfs + "domain", kEx + "Member");
+	o.addTriple(kEx + "memberOf", kRdfs + "range", kEx + "Team");
+	o.addTriple(kEx + "homepage", kRdfs + "domain", kEx + "HasPage");
+	o.addTriple(kEx + "name", kRdfs + "domain", kEx + "Named");
+	o.addTriple(kEx + "name", kRdfs + "range", kEx + "NotForLiterals");
+	o.addTriple(kEx + "worksIn", kOwl + "inverseOf", kEx + "hasWorker");
+	o.addTriple(kEx + "hasMember", kOwl + "inverseOf", kEx + "memberOf");
+	o.addTriple(kEx + "manager", kOwl + "inverseOf", kEx + "manages");
+	o.addTriple(kEx + "manages", kSubPropertyOf, kEx + "leads");
+	o.addTriple(kEx + "leads", kRdfs + "domain", kEx + "Lead");
+	o.addTriple(kEx + "next", kType, kOwl + "TransitiveProperty");
+	return o;
+}
+
+std::size_t transitiveRewrites(const std::string &body) {
+	auto q = sparql::Parser().parseString("PREFIX ex: <http://example.com/ns#>\n" + body);
+	return sparql2sql::applyTransitiveProperties(*q, owlOntology());
+}
+
+} // namespace
+
+TEST_CASE("Ontology: domain, range, inverse, symmetric and transitive axioms", "[sparql2sql]") {
+	Ontology o = owlOntology();
+	CHECK(o.axiomCount() == 14);
+	CHECK(o.domainsOf(kEx + "worksIn") == std::set<std::string> {kEx + "Worker"});
+	CHECK(o.rangesOf(kEx + "worksIn") == std::set<std::string> {kEx + "Unit"});
+	CHECK(o.domainsOf(kEx + "nothing").empty());
+	// owl:inverseOf works in both directions.
+	CHECK(o.inversesOf(kEx + "memberOf") == std::set<std::string> {kEx + "hasMember"});
+	CHECK(o.inversesOf(kEx + "hasMember") == std::set<std::string> {kEx + "memberOf"});
+
+	CHECK(o.addTriple(kEx + "knows", kType, kOwl + "SymmetricProperty"));
+	CHECK(o.inversesOf(kEx + "knows") == std::set<std::string> {kEx + "knows"});
+	CHECK(o.addTriple(kEx + "partOf", kOwl + "inverseOf", kEx + "partOf"));
+	CHECK(o.inversesOf(kEx + "partOf") == std::set<std::string> {kEx + "partOf"});
+	CHECK_FALSE(o.addTriple(kEx + "x", kType, kOwl + "FunctionalProperty"));
+
+	// Transitive: declared, the inverse of one, an equivalent of one; not a subproperty.
+	o.addTriple(kEx + "ancestorOf", kType, kOwl + "TransitiveProperty");
+	o.addTriple(kEx + "descendantOf", kOwl + "inverseOf", kEx + "ancestorOf");
+	o.addTriple(kEx + "forebearOf", "http://www.w3.org/2002/07/owl#equivalentProperty", kEx + "ancestorOf");
+	o.addTriple(kEx + "parentOf", kSubPropertyOf, kEx + "ancestorOf");
+	CHECK(o.isTransitive(kEx + "ancestorOf"));
+	CHECK(o.isTransitive(kEx + "descendantOf"));
+	CHECK(o.isTransitive(kEx + "forebearOf"));
+	CHECK_FALSE(o.isTransitive(kEx + "parentOf"));
+}
+
+TEST_CASE("saturateMapping: derives maps for inverses, domains and ranges", "[sparql2sql]") {
+	R2RMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_R2RML_DIR "sparql2sql_owl.ttl");
+	REQUIRE(mapping.isValid());
+	const std::size_t before = mapping.triplesMaps.size();
+	auto result = saturateMapping(mapping, owlOntology());
+	// Inverses: hasWorker, hasMember (the join reversed), manages. Domains and
+	// ranges: name (domain), worksIn (domain, range), memberOf (domain, range),
+	// and leads' domain on the manages inverse. homepage's domain goes on the
+	// subject map; name's range is skipped (a literal).
+	CHECK(result.triplesMapsAdded == 9);
+	CHECK(mapping.triplesMaps.size() == before + 9);
+	REQUIRE(mapping.isValid());
+
+	// A domain over a nullable object reads only the rows where it is set.
+	const std::string worker = translate(mapping, "SELECT ?x WHERE { ?x a ex:Worker }");
+	CHECK(worker.find("\"t\".\"DEPTNO\" IS NOT NULL") != std::string::npos);
+	// Through a join: rows whose join finds a parent row.
+	const std::string member = translate(mapping, "SELECT ?x WHERE { ?x a ex:Member }");
+	CHECK(member.find("EXISTS (SELECT 1 FROM \"DEPT\" AS \"o\" WHERE \"o\".\"DEPTNO\" = \"t\".\"DEPTNO\"") !=
+	      std::string::npos);
+	// A domain whose object is made of the subject's columns needs no filtered view.
+	const std::string page = translate(mapping, "SELECT ?x WHERE { ?x a ex:HasPage }");
+	CHECK(page.find("AS \"t\"") == std::string::npos);
+	CHECK(page.find("\"EMP\"") != std::string::npos);
+}
+
+TEST_CASE("applyTransitiveProperties: rewrites transitive steps to P+", "[sparql2sql]") {
+	CHECK(transitiveRewrites("SELECT * WHERE { ?a ex:next ?b }") == 1);
+	CHECK(transitiveRewrites("SELECT * WHERE { ?a ex:name ?b }") == 0);
+	CHECK(transitiveRewrites("SELECT * WHERE { ?a ex:next/ex:next ?b }") == 2);
+	CHECK(transitiveRewrites("SELECT * WHERE { ?a ^ex:next|ex:name ?b }") == 1);
+	// Already a closure: left alone.
+	CHECK(transitiveRewrites("SELECT * WHERE { ?a ex:next* ?b }") == 0);
+	CHECK(transitiveRewrites("SELECT * WHERE { ?a ex:next+ ?b }") == 0);
+	// Nested patterns, EXISTS and subqueries.
+	CHECK(transitiveRewrites("SELECT * WHERE { ?a ex:name ?n OPTIONAL { ?a ex:next ?b } "
+	                         "FILTER EXISTS { ?b ex:next ?c } { SELECT ?d WHERE { ?d ex:next ?e } } }") == 3);
+	// CONSTRUCT WHERE: the parser copied the template, so only the pattern changes.
+	CHECK(transitiveRewrites("CONSTRUCT WHERE { ?a ex:next ?b }") == 1);
+	CHECK(transitiveRewrites("CONSTRUCT { ?a ex:next ?b } WHERE { ?a ex:next ?b }") == 1);
+
+	// The rewritten query translates to a recursive CTE.
+	R2RMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_R2RML_DIR "sparql2sql_owl.ttl");
+	auto q = sparql::Parser().parseString("PREFIX ex: <http://example.com/ns#>\nSELECT * WHERE { ?a ex:next ?b }");
+	sparql2sql::applyTransitiveProperties(*q, owlOntology());
+	sparql2sql::DuckDbDialect dialect;
+	CHECK(sparql2sql::translateQuery(*q, mapping, dialect).find("RECURSIVE") != std::string::npos);
+}

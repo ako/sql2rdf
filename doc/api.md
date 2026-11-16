@@ -500,6 +500,21 @@ public:
 
 ---
 
+### Building maps after parsing (`include/r2rml/MapFactory.h`)
+
+The concrete subject, graph and referencing object map classes are private to the library. Code
+that derives new maps from a parsed mapping (mapping saturation, `sparql2sql/Ontology.h`) builds
+them through these functions:
+
+| Function | Returns |
+|----------|---------|
+| `cloneTermMap(map)` | a copy of a constant, column or template term map (term type, datatype, language and inverse expression included); `nullptr` for any other kind |
+| `makeSubjectMap(value)` | a subject map producing `value`'s terms, with no classes or graph maps |
+| `cloneGraphMap(map)` | a copy of a graph map; `nullptr` when its value map cannot be copied |
+| `makeReferencingObjectMap(parent, joinConditions)` | a referencing object map joining to `parent` |
+
+---
+
 ## Inside-Out Mode
 
 "Inside-out" mode is intended for SQL-export / macro scenarios where row data is supplied externally rather than fetched from a database. In this mode the following R2RML constructs are **prohibited**:
@@ -1017,25 +1032,52 @@ which no map in the mapping produces, so a pattern using it can never match
 sparql2sql::Ontology ontology;
 ontology.addTriple(s, p, o);   // true for a recognised axiom
 sparql2sql::SaturationResult r = sparql2sql::saturateMapping(mapping, ontology);
-// then translateQuery(query, mapping, ...) as usual
+auto query = sparql::Parser().parseString(text);
+sparql2sql::applyTransitiveProperties(*query, ontology);
+// then translateQuery(*query, mapping, ...) as usual
 ```
 
-RDFS-style query answering without changing the query or the translator. This is the
-"T-mapping" approach Ontop uses: before translation, the mapping is expanded so that every map
-that produces a class or property also produces what the ontology says it implies.
+Query answering under an ontology without changing the translator. This is the "T-mapping"
+approach Ontop uses: before translation, the mapping is expanded so that every map that produces
+a class or property also produces what the ontology says it implies. Transitive properties are the
+one exception, handled by rewriting the query.
 
-- Recognised axioms (between named IRIs): `rdfs:subClassOf`, `rdfs:subPropertyOf`, and
-  `owl:equivalentClass`/`owl:equivalentProperty` (a sub-relation both ways). Hierarchies are
-  closed transitively, and cycles are fine. Other triples, and axioms whose object is a blank node
-  (OWL restrictions), are ignored.
+- Recognised axioms (between named IRIs): `rdfs:subClassOf`, `rdfs:subPropertyOf`,
+  `owl:equivalentClass`/`owl:equivalentProperty` (a sub-relation both ways), `rdfs:domain`,
+  `rdfs:range`, `owl:inverseOf`, and `rdf:type` `owl:SymmetricProperty` (its own inverse) and
+  `owl:TransitiveProperty`. Hierarchies are closed transitively, and cycles are fine. Other
+  triples, and axioms whose object is a blank node (OWL restrictions), are ignored.
 - Each `rr:class` gains its superclasses. So does an `rr:predicate rdf:type; rr:object <C>`
   predicate-object map, when `rdf:type` is its only predicate.
 - Each constant `rr:predicate` gains its superproperties.
+- `owl:inverseOf Q` on predicate P adds a triples map with subject and object swapped, producing
+  `(o Q s)` for every `(s P o)`. For a referencing object map, the join is reversed: the new map
+  runs over the parent's logical table and refers back to the child map.
+- `rdfs:domain D` gives the subject class D. When the object is produced whenever the subject is
+  (a constant, or a template or column using only the subject's columns), D goes on the subject
+  map itself. Otherwise a new map types the subject over only the rows where the object (and any
+  graph) is not NULL, or, for a referencing object map, where the join finds a parent row.
+- `rdfs:range R` gives an IRI or blank node object class R, through a new map whose subject is
+  the object, over the rows that produce the triple. Literal objects get no class.
+- The filtered maps are `rr:sqlQuery` views over the original logical table
+  (`SELECT * FROM <table> AS "t" WHERE "t"."col" IS NOT NULL ...`, or an `EXISTS` over the other
+  side of a join), written with ANSI double-quoted identifiers. Being views, they have no declared
+  keys, so their arms keep the duplicate-removing `DISTINCT`.
+- The steps run once, in order: superproperties, inverses, superproperties of the inverses,
+  domains and ranges, then superclasses of every class so far. `saturateMapping` is meant to be
+  called once per mapping: a second call adds the derived maps again.
+- `applyTransitiveProperties` rewrites every triple pattern or path step whose predicate is a
+  transitive property P to `P+` (translated through a recursive CTE), everywhere in the query:
+  nested groups, `OPTIONAL`, `UNION`, `MINUS`, `GRAPH`, `EXISTS` and subqueries. Steps already
+  under `*` or `+` are left alone. A property is transitive when declared so, or when it is the
+  inverse or an equivalent of one that is; a subproperty of a transitive property is not.
 - A triple pattern's candidate maps are combined with a duplicate-removing union, so a
   resource typed by several subclasses appears once in `?x a ex:Super`.
-- Not covered: `rdfs:domain`/`rdfs:range`, inverse and transitive properties, and OWL class
-  expressions. A generic triple map, whose predicate or `rdf:type` object comes from a column,
-  cannot be expanded, so facts it produces are not reasoned over.
+- Not covered: OWL class expressions (restrictions, unions, intersections), property chains,
+  functional and inverse-functional properties, and `owl:sameAs`. A generic triple map, whose
+  predicate or `rdf:type` object comes from a column, cannot be expanded, so facts it produces are
+  not reasoned over. A referencing object map whose triple has a graph map reading child columns
+  gets no inverse and no range class (the graph would be read from the parent's rows).
 - Run `saturateMapping` before `checkVocabulary`, so inferred classes and properties count as
   known.
 

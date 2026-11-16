@@ -1,0 +1,29 @@
+@prefix rr:  <http://www.w3.org/ns/r2rml#> .
+@prefix ex:  <http://example.com/ns#> .
+
+# Fixture for rdfs:domain / rdfs:range / owl:inverseOf / owl:TransitiveProperty
+# reasoning (Ontology.h). JONES has no department and no manager, so a domain
+# or range that ignored NULL objects would wrongly type him or a department.
+<#Employees>
+    rr:logicalTable [ rr:tableName "EMP" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/employee/{EMPNO}" ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "ENAME" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:homepage ; rr:objectMap [ rr:template "http://pages.example.com/{EMPNO}" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:worksIn ;
+                            rr:objectMap [ rr:template "http://data.example.com/department/{DEPTNO}" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:manager ;
+                            rr:objectMap [ rr:template "http://data.example.com/employee/{MGR}" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:memberOf ;
+                            rr:objectMap [ rr:parentTriplesMap <#Departments> ;
+                                           rr:joinCondition [ rr:child "DEPTNO" ; rr:parent "DEPTNO" ] ] ] .
+
+<#Departments>
+    rr:logicalTable [ rr:tableName "DEPT" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/department/{DEPTNO}" ] ;
+    rr:predicateObjectMap [ rr:predicate ex:deptName ; rr:objectMap [ rr:column "DNAME" ] ] .
+
+<#Nodes>
+    rr:logicalTable [ rr:tableName "NODES" ] ;
+    rr:subjectMap [ rr:template "http://data.example.com/node/{ID}" ] ;
+    rr:predicateObjectMap [ rr:predicate ex:next ;
+                            rr:objectMap [ rr:template "http://data.example.com/node/{NEXT}" ] ] .

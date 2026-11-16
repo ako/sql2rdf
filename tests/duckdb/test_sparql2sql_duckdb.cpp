@@ -2533,3 +2533,128 @@ TEST_CASE("reasoning: all types of a resource, asserted and inferred") {
 	CHECK(types == std::set<std::string> {ex + "Engineer", ex + "Manager", ex + "Staff", ex + "Person"});
 	CHECK(rows.size() == 4);
 }
+
+// ---------------------------------------------------------------------------
+// Domains, ranges, inverse and transitive properties (Ontology.h): triples the
+// ontology entails, and none for rows whose object is NULL.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+sparql2sql::Ontology owlOntology() {
+	const std::string ex = "http://example.com/ns#";
+	const std::string rdfs = "http://www.w3.org/2000/01/rdf-schema#";
+	const std::string owl = "http://www.w3.org/2002/07/owl#";
+	const std::string type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+	sparql2sql::Ontology o;
+	o.addTriple(ex + "worksIn", rdfs + "domain", ex + "Worker");
+	o.addTriple(ex + "Worker", rdfs + "subClassOf", ex + "Agent");
+	o.addTriple(ex + "worksIn", rdfs + "range", ex + "Unit");
+	o.addTriple(ex + "memberOf", rdfs + "domain", ex + "Member");
+	o.addTriple(ex + "memberOf", rdfs + "range", ex + "Team");
+	o.addTriple(ex + "homepage", rdfs + "domain", ex + "HasPage");
+	o.addTriple(ex + "name", rdfs + "domain", ex + "Named");
+	o.addTriple(ex + "name", rdfs + "range", ex + "NotForLiterals");
+	o.addTriple(ex + "worksIn", owl + "inverseOf", ex + "hasWorker");
+	o.addTriple(ex + "hasMember", owl + "inverseOf", ex + "memberOf");
+	o.addTriple(ex + "manager", owl + "inverseOf", ex + "manages");
+	o.addTriple(ex + "manages", rdfs + "subPropertyOf", ex + "leads");
+	o.addTriple(ex + "leads", rdfs + "domain", ex + "Lead");
+	o.addTriple(ex + "next", type, owl + "TransitiveProperty");
+	return o;
+}
+
+std::vector<Row> runOwl(DuckDBConnection &conn, const std::string &body, bool withOntology = true) {
+	R2RMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_R2RML_DIR "sparql2sql_owl.ttl");
+	const auto ontology = owlOntology();
+	if (withOntology) {
+		sparql2sql::saturateMapping(mapping, ontology);
+	}
+	Parser sparqlParser;
+	auto query = sparqlParser.parseString("PREFIX ex: <http://example.com/ns#>\n" + body);
+	if (withOntology) {
+		sparql2sql::applyTransitiveProperties(*query, ontology);
+	}
+	DuckDbDialect dialect;
+	std::string sql = translateQuery(*query, mapping, dialect, nullptr);
+	INFO("SQL: " << sql);
+	std::unique_ptr<r2rml::SQLResultSet> rs = conn.execute(sql);
+	return collectRows(*rs);
+}
+
+std::set<std::string> column(const std::vector<Row> &rows, const std::string &name) {
+	std::set<std::string> out;
+	for (const auto &r : rows) {
+		out.insert(r.at(name));
+	}
+	return out;
+}
+
+const std::string kEmp = "http://data.example.com/employee/";
+const std::string kDept = "http://data.example.com/department/";
+const std::string kNode = "http://data.example.com/node/";
+
+} // namespace
+
+TEST_CASE("reasoning: rdfs:domain types only subjects whose object is set") {
+	auto conn = makeSeededDatabase();
+	auto rows = runOwl(*conn, "SELECT ?x WHERE { ?x a ex:Worker }");
+	CHECK(rows.size() == 1);
+	CHECK(column(rows, "V_X") == std::set<std::string> {kEmp + "7369"});
+	// ...and the domain class's superclasses too.
+	CHECK(column(runOwl(*conn, "SELECT ?x WHERE { ?x a ex:Agent }"), "V_X") == std::set<std::string> {kEmp + "7369"});
+	CHECK(runOwl(*conn, "SELECT ?x WHERE { ?x a ex:Worker }", false).empty());
+}
+
+TEST_CASE("reasoning: rdfs:domain on an object made of the subject's columns goes on the subject map") {
+	auto conn = makeSeededDatabase();
+	CHECK(column(runOwl(*conn, "SELECT ?x WHERE { ?x a ex:HasPage }"), "V_X") ==
+	      std::set<std::string> {kEmp + "7369", kEmp + "7400"});
+	CHECK(column(runOwl(*conn, "SELECT ?x WHERE { ?x a ex:Named }"), "V_X") ==
+	      std::set<std::string> {kEmp + "7369", kEmp + "7400"});
+}
+
+TEST_CASE("reasoning: rdfs:range types IRI objects, never literals") {
+	auto conn = makeSeededDatabase();
+	// Department 20 has no employee, so nothing says it is a Unit.
+	CHECK(column(runOwl(*conn, "SELECT ?u WHERE { ?u a ex:Unit }"), "V_U") == std::set<std::string> {kDept + "10"});
+	CHECK(runOwl(*conn, "SELECT ?u WHERE { ?u a ex:NotForLiterals }").empty());
+}
+
+TEST_CASE("reasoning: domain and range through a referencing object map") {
+	auto conn = makeSeededDatabase();
+	CHECK(column(runOwl(*conn, "SELECT ?x WHERE { ?x a ex:Member }"), "V_X") == std::set<std::string> {kEmp + "7369"});
+	CHECK(column(runOwl(*conn, "SELECT ?t WHERE { ?t a ex:Team }"), "V_T") == std::set<std::string> {kDept + "10"});
+}
+
+TEST_CASE("reasoning: owl:inverseOf swaps subject and object") {
+	auto conn = makeSeededDatabase();
+	auto rows = runOwl(*conn, "SELECT ?d ?e WHERE { ?d ex:hasWorker ?e }");
+	REQUIRE(rows.size() == 1);
+	CHECK(containsRow(rows, {{"V_D", kDept + "10"}, {"V_E", kEmp + "7369"}}));
+	// Declared in the other direction (hasMember inverseOf memberOf), through a join.
+	rows = runOwl(*conn, "SELECT ?d ?e WHERE { ?d ex:hasMember ?e }");
+	REQUIRE(rows.size() == 1);
+	CHECK(containsRow(rows, {{"V_D", kDept + "10"}, {"V_E", kEmp + "7369"}}));
+	// The inverse's superproperty and that one's domain.
+	rows = runOwl(*conn, "SELECT ?m ?e WHERE { ?m ex:leads ?e }");
+	REQUIRE(rows.size() == 1);
+	CHECK(containsRow(rows, {{"V_M", kEmp + "7400"}, {"V_E", kEmp + "7369"}}));
+	CHECK(column(runOwl(*conn, "SELECT ?m WHERE { ?m a ex:Lead }"), "V_M") == std::set<std::string> {kEmp + "7400"});
+}
+
+TEST_CASE("reasoning: a transitive property follows chains of any length") {
+	auto conn = makeSeededDatabase();
+	CHECK(column(runOwl(*conn, "SELECT ?n WHERE { <" + kNode + "1> ex:next ?n }"), "V_N") ==
+	      std::set<std::string> {kNode + "2", kNode + "3"});
+	CHECK(runOwl(*conn, "SELECT ?a ?b WHERE { ?a ex:next ?b }").size() == 3);
+	CHECK(runOwl(*conn, "SELECT ?a ?b WHERE { ?a ex:next ?b }", false).size() == 2);
+	// Inside a sequence path, and under * left alone.
+	CHECK(column(runOwl(*conn, "SELECT ?n WHERE { <" + kNode + "1> ex:next/ex:next ?n }"), "V_N") ==
+	      std::set<std::string> {kNode + "3"});
+	CHECK(column(runOwl(*conn, "SELECT ?n WHERE { <" + kNode + "1> ex:next* ?n }"), "V_N") ==
+	      std::set<std::string> {kNode + "1", kNode + "2", kNode + "3"});
+	// CONSTRUCT returns the entailed triples too.
+	CHECK(runOwl(*conn, "CONSTRUCT WHERE { ?a ex:next ?b }").size() == 3);
+}
