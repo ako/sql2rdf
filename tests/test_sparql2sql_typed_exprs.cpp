@@ -207,10 +207,10 @@ TEST_CASE("ORDER BY: an IRI-valued key is not cast", "[sparql2sql]") {
 
 // --- Aggregates ---
 
-TEST_CASE("MIN/MAX: a known-integral argument aggregates numerically", "[sparql2sql]") {
+TEST_CASE("MIN/MAX: a known-integral argument compares numerically, returns the stored term", "[sparql2sql]") {
 	const std::string sql = translate("SELECT (MIN(?a) AS ?mn) (MAX(?a) AS ?mx) WHERE { ?m ex:amount ?a }");
-	CHECK(contains(sql, "MIN(TRY_CAST("));
-	CHECK(contains(sql, "MAX(TRY_CAST("));
+	CHECK(contains(sql, "arg_min("));
+	CHECK(contains(sql, "arg_max("));
 	CHECK(contains(sql, "AS BIGINT"));
 }
 
@@ -220,10 +220,10 @@ TEST_CASE("MIN/MAX: an unknown-datatype argument stays lexicographic", "[sparql2
 	CHECK_FALSE(contains(sql, "MIN(TRY_CAST("));
 }
 
-TEST_CASE("MIN/MAX: a dateTime argument is canonicalised back to XSD's 'T' form", "[sparql2sql]") {
+TEST_CASE("MIN/MAX: a dateTime argument compares as a timestamp, returns the stored term", "[sparql2sql]") {
 	const std::string sql = translate("SELECT (MIN(?w) AS ?mn) WHERE { ?m ex:when ?w }");
+	CHECK(contains(sql, "arg_min("));
 	CHECK(contains(sql, "AS TIMESTAMP"));
-	CHECK(contains(sql, "' ', 'T'"));
 }
 
 TEST_CASE("SUM: an integral argument keeps an integral lexical form", "[sparql2sql]") {
@@ -245,8 +245,10 @@ TEST_CASE("SUM: an xsd:decimal argument stays fixed-point", "[sparql2sql]") {
 TEST_CASE("MIN/MAX: an xsd:decimal argument stays fixed-point", "[sparql2sql]") {
 	for (const char *fn : {"MIN", "MAX"}) {
 		const std::string sql = translate(std::string("SELECT (") + fn + "(?p) AS ?s) WHERE { ?m ex:price ?p }");
-		CHECK(contains(sql, std::string(fn) + "(TRY_CAST("));
+		CHECK(contains(sql, std::string(fn) == "MIN" ? "arg_min(" : "arg_max("));
 		CHECK(contains(sql, "AS DECIMAL(38,18)"));
+		// Returned as stored, not re-rendered: no trailing-zero stripping.
+		CHECK_FALSE(contains(sql, "regexp_replace("));
 		CHECK_FALSE(contains(sql, "AS DOUBLE"));
 	}
 }

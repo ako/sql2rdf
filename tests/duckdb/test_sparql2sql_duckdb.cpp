@@ -440,13 +440,14 @@ TEST_CASE("emp_dept_aggregate.rq: COUNT per department") {
 	CHECK(containsRow(rows, {{"V_D", "http://data.example.com/department/10"}, {"V_CNT", "1"}}));
 }
 
-TEST_CASE("decimal_aggregates.rq: SUM/MIN/MAX over xsd:decimal are exact and canonical") {
+TEST_CASE("decimal_aggregates.rq: SUM over xsd:decimal is exact; MIN/MAX return a stored term") {
 	auto conn = makeSeededDatabase();
 	auto rows = translateAndRun(*conn, "decimal_aggregates.rq", "sparql2sql_decimal.ttl");
 	REQUIRE(rows.size() == 1);
-	// A DOUBLE sum would give "0.30000000000000004"; trailing zeros of the
-	// DECIMAL(38,18) working type are trimmed to the canonical lexical form.
-	CHECK(containsRow(rows, {{"V_TOTAL", "0.3"}, {"V_LO", "0.1"}, {"V_HI", "0.2"}}));
+	// A DOUBLE sum would give "0.30000000000000004"; SUM makes a new value, whose
+	// trailing zeros of the DECIMAL(38,18) working type are trimmed. MIN and MAX
+	// return one of the input terms (SPARQL 1.1 §18.5.1): "0.10", as stored.
+	CHECK(containsRow(rows, {{"V_TOTAL", "0.3"}, {"V_LO", "0.10"}, {"V_HI", "0.20"}}));
 }
 
 TEST_CASE("emp_dept_name_count.rq: COUNT(*) over a multi-candidate predicate doesn't double-count the "
@@ -2685,4 +2686,25 @@ TEST_CASE("shared scan: one subject's properties, the same rows with and without
 	CHECK(shared.size() >= 4); // type, name, knows, department
 	CHECK(shared == separate);
 	CHECK(containsRow(shared, {{"V_P", "http://example.com/ns#name"}, {"V_V", "SMITH"}}));
+}
+
+TEST_CASE("MAX in a subquery joins back to the row that holds it") {
+	// "The most expensive item": the subquery's MAX must be the same RDF term
+	// as the stored value ("5.00", not "5"), or the join finds nothing.
+	auto conn = makeSeededDatabase();
+	R2RMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_R2RML_DIR "sparql2sql_decimal.ttl");
+	auto rows =
+	    runWithCatalog(*conn,
+	                   "PREFIX ex: <http://example.com/ns#>\n"
+	                   "SELECT ?p ?a WHERE { { SELECT (MAX(?x) AS ?a) WHERE { ?q ex:paid ?x } } ?p ex:paid ?a }",
+	                   mapping, nullptr);
+	REQUIRE(rows.size() == 1);
+	CHECK(rows[0].at("V_A") == "5.00");
+	rows = runWithCatalog(*conn,
+	                      "PREFIX ex: <http://example.com/ns#>\n"
+	                      "SELECT ?p WHERE { ?p ex:paid ?a { SELECT (MIN(?x) AS ?lo) WHERE { ?q ex:paid ?x } } "
+	                      "FILTER(?a = ?lo) }",
+	                      mapping, nullptr);
+	CHECK(rows.size() == 1);
 }

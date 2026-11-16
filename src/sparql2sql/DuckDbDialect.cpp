@@ -135,6 +135,11 @@ std::string DuckDbDialect::floatSignBit(const std::string &expr) const {
 	return "signbit(" + expr + ")";
 }
 
+std::string DuckDbDialect::argExtremeAgg(bool max, const std::string &value, const std::string &key) const {
+	// arg_min/arg_max skip rows whose key is NULL, as MIN/MAX skip NULLs.
+	return std::string(max ? "arg_max(" : "arg_min(") + value + ", " + key + ")";
+}
+
 std::string DuckDbDialect::anyValueAgg(const std::string &expr) const {
 	return "any_value(" + expr + ")";
 }

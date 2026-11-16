@@ -847,32 +847,32 @@ std::string translateAggregate(const AggregateExpr &agg, const TranslatedPattern
 		return "CAST(AVG(" + distinctPrefix + dialect.tryCastToDouble(numArg) + ") AS VARCHAR)";
 	case AggregateKind::Min:
 	case AggregateKind::Max: {
-		// Aggregate in the argument's static type when the mapping declares one;
+		// Compare in the argument's static type when the mapping declares one;
 		// otherwise fall back to a lexicographic MIN/MAX over the raw text
 		// (which is what every untyped variable still gets).
 		//
-		// Behaviour worth knowing: a typed MIN/MAX returns the SQL engine's
-		// canonical rendering of the winning value, so MIN over xsd:integer
-		// values "007" and "42" yields "7", not "007". That is the correct
-		// XSD-canonical answer, but it is different text than the untyped path
-		// produces - see doc/api.md.
-		const std::string fn = (agg.aggKind == AggregateKind::Min) ? "MIN(" : "MAX(";
+		// SPARQL's MIN/MAX (§18.5.1) return one of the input terms, so a typed
+		// MIN/MAX compares the typed value but returns the winning row's own
+		// lexical form: MAX over "78.8900"^^xsd:decimal is "78.8900", the same
+		// term a FILTER or join on the result must meet again, not the
+		// engine's canonical "78.89". (DISTINCT cannot change a minimum or a
+		// maximum, so it is dropped.)
+		const bool isMax = agg.aggKind == AggregateKind::Max;
+		const std::string fn = isMax ? "MAX(" : "MIN(";
+		std::string key;
 		if (argInfo.isIntegral()) {
-			return "CAST(" + fn + distinctPrefix + dialect.tryCastToBigInt(intArg) + ") AS VARCHAR)";
+			key = dialect.tryCastToBigInt(intArg);
+		} else if (argInfo.datatypeIri == xsd::kDecimal) {
+			key = dialect.tryCastToDecimal(decArg);
+		} else if (argInfo.isNumeric()) {
+			key = dialect.tryCastToDouble(numArg);
+		} else if (argInfo.datatypeIri == xsd::kDate) {
+			key = dialect.tryCastToDate(arg);
+		} else if (argInfo.isTemporal()) {
+			key = dialect.tryCastToTimestamp(arg);
 		}
-		if (argInfo.datatypeIri == xsd::kDecimal) {
-			return dialect.decimalToLexical(fn + distinctPrefix + dialect.tryCastToDecimal(decArg) + ")");
-		}
-		if (argInfo.isNumeric()) {
-			return "CAST(" + fn + distinctPrefix + dialect.tryCastToDouble(numArg) + ") AS VARCHAR)";
-		}
-		if (argInfo.datatypeIri == xsd::kDate) {
-			return "CAST(" + fn + distinctPrefix + dialect.tryCastToDate(arg) + ") AS VARCHAR)";
-		}
-		if (argInfo.isTemporal()) {
-			// Reuse translateXsdCast's canonicalisation: DuckDB renders a
-			// TIMESTAMP with a space separator, XSD dateTime wants 'T'.
-			return "REPLACE(CAST(" + fn + distinctPrefix + dialect.tryCastToTimestamp(arg) + ") AS VARCHAR), ' ', 'T')";
+		if (!key.empty()) {
+			return dialect.argExtremeAgg(isMax, arg, key);
 		}
 		return fn + distinctPrefix + arg + ")";
 	}
