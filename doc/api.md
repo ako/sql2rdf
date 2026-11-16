@@ -613,6 +613,19 @@ IRIs built from one such column by an invertible template. Independently of the 
 a variable bound in every row becomes `COUNT(*)`, so the engine never builds the term. Results are
 identical to the text path; `tests/duckdb` checks every case both ways.
 
+**Deduplicating raw columns.** RDF is a set, so a select-project-join block whose rows a key cannot prove
+unique is rendered with `SELECT DISTINCT`. Over the finished terms that means building every IRI and
+text value before hashing it. With a catalog, a DISTINCT block whose every column is a constant, a plain
+column or an invertible template over typed columns is rendered instead as
+`SELECT <terms built from r0..rN> FROM (SELECT DISTINCT <raw columns> AS r0..rN FROM ... WHERE ...)`: each
+term is a one-to-one function of its columns, and every raw column feeds a term, so both forms keep the
+same rows. Integer, string, DECIMAL, DATE, TIMESTAMP and BOOLEAN columns qualify. Floating-point columns
+qualify with their sign bit added to the dedup key (`SqlDialect::floatSignBit`, DuckDB's `signbit`),
+because -0.0 and 0.0 are equal values with different lexical forms; a dialect without one keeps the text
+DISTINCT for them. Anything else (unknown types, computed or coalesced columns, an expression that would
+still reach into a FROM source) keeps the text DISTINCT. On 10M Parquet rows without keys this makes
+counts and large joins about three times faster.
+
 **Term tags.** A SELECT column holds only the term's lexical form, so `<http://x>` and `"http://x"`
 look the same. With `TranslateOptions::termTags`, each output column `v_<var>` is followed by a
 VARCHAR column `d_<var>` with the term's tag, in `encodeTag`'s encoding:

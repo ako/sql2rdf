@@ -31,7 +31,7 @@ std::string translate(const std::string &body, const sparql2sql::TypeCatalog *ca
 
 sparql2sql::TypeCatalog aggCatalog() {
 	sparql2sql::TypeCatalog cat;
-	cat.columnTypes["AGG_ROWS"] = {{"ID", "INTEGER"},  {"QTY", "INTEGER"}, {"PRICE", "DECIMAL(10,2)"},
+	cat.columnTypes["AGG_ROWS"] = {{"ID", "INTEGER"},  {"QTY", "INTEGER"},  {"PRICE", "DECIMAL(10,2)"},
 	                               {"RATE", "DOUBLE"}, {"CODE", "VARCHAR"}, {"OWNER", "INTEGER"}};
 	return cat;
 }
@@ -49,9 +49,10 @@ TEST_CASE("native aggregates: with a catalog, SUM reads the companion column", "
 	const auto cat = aggCatalog();
 	const std::string sql = translate("SELECT (SUM(?q) AS ?s) WHERE { ?m ex:qty ?q }", &cat);
 	CHECK(sql.find("AS \"n_q\"") != std::string::npos);
-	CHECK(sql.find("\"v_q\" AS BIGINT") == std::string::npos); // no text re-parse ...
+	CHECK(sql.find("\"v_q\" AS BIGINT") == std::string::npos);  // no text re-parse ...
 	CHECK(sql.find(".\"n_q\" AS BIGINT") != std::string::npos); // ... the native value instead
 	// A union root (two maps for one predicate) gets no companions.
-	const std::string none = translate("SELECT (SUM(?q) AS ?s) WHERE { { ?m ex:qty ?q } UNION { ?m ex:price ?q } }", &cat);
+	const std::string none =
+	    translate("SELECT (SUM(?q) AS ?s) WHERE { { ?m ex:qty ?q } UNION { ?m ex:price ?q } }", &cat);
 	CHECK(none.find("n_q") == std::string::npos);
 }

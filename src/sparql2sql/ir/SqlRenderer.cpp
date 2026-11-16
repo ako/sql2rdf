@@ -1,5 +1,8 @@
 #include "sparql2sql/ir/SqlRenderer.h"
 
+#include <algorithm>
+#include <cctype>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -9,6 +12,7 @@
 #include "sparql2sql/SqlDialect.h"
 #include "sparql2sql/TagSql.h"
 #include "sparql2sql/TranslationError.h"
+#include "sparql2sql/TypeCatalog.h"
 #include "sparql2sql/ir/NativeKey.h"
 #include "sparql2sql/ir/RelNode.h"
 
@@ -145,6 +149,162 @@ std::string keyTagComparison(const EquiKey &k, TranslationContext &ctx, const st
 // for the common case without over-allocating too much.
 using ExtraProjections = std::vector<std::pair<std::string, std::string>>;
 
+bool isIdentChar(char ch) {
+	return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+}
+
+// Replace every occurrence of the column reference `ref` (e.g. t5."cid") that is
+// not the tail of a longer identifier (t15."cid").
+std::string replaceRef(const std::string &text, const std::string &ref, const std::string &with) {
+	std::string out;
+	std::size_t pos = 0;
+	while (true) {
+		const std::size_t hit = text.find(ref, pos);
+		if (hit == std::string::npos) {
+			out.append(text, pos, std::string::npos);
+			return out;
+		}
+		out.append(text, pos, hit - pos);
+		if (hit > 0 && isIdentChar(text[hit - 1])) {
+			out += ref;
+		} else {
+			out += with;
+		}
+		pos = hit + ref.size();
+	}
+}
+
+// True when some `<identifier>."` column reference other than `allowedAlias."`
+// is left in `text`, i.e. the expression still reaches into a FROM source.
+bool referencesOtherAlias(const std::string &text, const std::string &allowedAlias) {
+	for (std::size_t pos = text.find(".\""); pos != std::string::npos; pos = text.find(".\"", pos + 1)) {
+		std::size_t start = pos;
+		while (start > 0 && isIdentChar(text[start - 1])) {
+			--start;
+		}
+		if (start < pos && text.compare(start, pos - start, allowedAlias) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// How a column's raw values may stand in for its text when deduplicating.
+// Exact: the text rendering is one-to-one with the value. Floating: one-to-one
+// except that -0.0 and 0.0 are equal but print differently, so the dedup key
+// also needs the sign bit. None: unknown type, or anything else.
+enum class RawKind { None, Exact, Floating };
+
+RawKind rawKind(const TypeCatalog &cat, const std::string &table, const std::string &column) {
+	if (cat.isIntegerType(table, column) || cat.isStringType(table, column)) {
+		return RawKind::Exact;
+	}
+	std::string type = cat.typeOf(table, column);
+	std::transform(type.begin(), type.end(), type.begin(), ::toupper);
+	for (const char *prefix : {"DECIMAL", "NUMERIC", "DATE", "TIMESTAMP", "BOOLEAN"}) {
+		if (type.rfind(prefix, 0) == 0) {
+			return RawKind::Exact;
+		}
+	}
+	for (const char *prefix : {"DOUBLE", "FLOAT", "REAL"}) {
+		if (type.rfind(prefix, 0) == 0) {
+			return RawKind::Floating;
+		}
+	}
+	return RawKind::None;
+}
+
+// Deduplicate on raw columns: a DISTINCT block whose every term is a constant, a
+// plain column or an invertible template over typed columns (see rawKind) is rendered
+// as SELECT <terms> FROM (SELECT DISTINCT <raw columns> FROM ... WHERE ...), so
+// the engine hashes the raw values instead of building every IRI and text value
+// first. Each term is a one-to-one function of its columns and every raw column
+// feeds some term, so both forms keep the same rows. Returns "" when the block
+// does not qualify, or when any projected expression would still reach into a
+// FROM source after substitution.
+std::string renderRawDistinct(const SpjRelation &rel, const std::vector<std::string> &cols, TranslationContext &ctx) {
+	if (ctx.catalog() == nullptr || rel.schema().empty()) {
+		return std::string();
+	}
+	const TypeCatalog &cat = *ctx.catalog();
+	const SqlDialect &dialect = ctx.dialect();
+	std::vector<std::string> refs;
+	std::set<std::string> floating;
+	// False when the column cannot take part; a floating column needs the dialect's sign bit.
+	auto addRef = [&](const std::string &ref, const std::string &table, const std::string &column) {
+		const RawKind kind = rawKind(cat, table, column);
+		if (kind == RawKind::None || (kind == RawKind::Floating && dialect.floatSignBit(ref).empty())) {
+			return false;
+		}
+		if (std::find(refs.begin(), refs.end(), ref) == refs.end()) {
+			refs.push_back(ref);
+		}
+		if (kind == RawKind::Floating) {
+			floating.insert(ref);
+		}
+		return true;
+	};
+	for (const auto &c : rel.schema()) {
+		switch (c.prov) {
+		case Provenance::ConstantExpr:
+			break;
+		case Provenance::PureColumn:
+			if (c.nativeColumnRef.empty() || !addRef(c.nativeColumnRef, c.tableIdentity, c.columnName)) {
+				return std::string();
+			}
+			break;
+		case Provenance::TemplateExpr:
+			if (!c.templateInvertible || c.templateColumnRefs.empty() ||
+			    c.templateColumnRefs.size() != c.templateColumnNames.size()) {
+				return std::string();
+			}
+			for (std::size_t i = 0; i < c.templateColumnRefs.size(); ++i) {
+				if (!addRef(c.templateColumnRefs[i], c.tableIdentity, c.templateColumnNames[i])) {
+					return std::string();
+				}
+			}
+			break;
+		default:
+			return std::string();
+		}
+	}
+	if (refs.empty()) {
+		return std::string();
+	}
+	const std::string alias = ctx.nextAlias();
+	std::vector<std::string> inner;
+	std::vector<std::string> outer;
+	for (std::size_t i = 0; i < refs.size(); ++i) {
+		inner.push_back(refs[i] + " AS " + dialect.quoteIdentifier("r" + std::to_string(i)));
+		if (floating.count(refs[i]) != 0) {
+			inner.push_back(dialect.floatSignBit(refs[i]) + " AS " + dialect.quoteIdentifier("s" + std::to_string(i)));
+		}
+	}
+	for (const auto &col : cols) {
+		std::string text = col;
+		for (std::size_t i = 0; i < refs.size(); ++i) {
+			text = replaceRef(text, refs[i], alias + "." + dialect.quoteIdentifier("r" + std::to_string(i)));
+		}
+		if (referencesOtherAlias(text, alias)) {
+			return std::string();
+		}
+		outer.push_back(text);
+	}
+	std::string sql = "SELECT DISTINCT" + joinColumnList(inner, ctx) + ctx.clauseSep() + "FROM ";
+	for (std::size_t i = 0; i < rel.sources.size(); ++i) {
+		sql += (i > 0 ? ", " : "") + rel.sources[i].sql;
+	}
+	if (!rel.whereConds.empty()) {
+		std::vector<std::string> conds;
+		conds.reserve(rel.whereConds.size());
+		for (const auto &c : rel.whereConds) {
+			conds.push_back("(" + c + ")");
+		}
+		sql += ctx.clauseSep() + "WHERE " + joinConditions(conds, ctx);
+	}
+	return "SELECT" + joinColumnList(outer, ctx) + ctx.clauseSep() + "FROM (" + sql + ") AS " + alias;
+}
+
 std::string renderSpj(const SpjRelation &rel, TranslationContext &ctx, const ExtraProjections *extra) {
 	const SqlDialect &dialect = ctx.dialect();
 	std::string sql;
@@ -174,6 +334,12 @@ std::string renderSpj(const SpjRelation &rel, TranslationContext &ctx, const Ext
 			// what a DISTINCT on this block keeps.
 			for (const auto &n : ctx.nativeRootExprs()) {
 				cols.push_back(n.second + " AS " + mangleVarNative(n.first, dialect));
+			}
+		}
+		if (rel.distinct) {
+			std::string raw = renderRawDistinct(rel, cols, ctx);
+			if (!raw.empty()) {
+				return raw;
 			}
 		}
 		sql += joinColumnList(cols, ctx);

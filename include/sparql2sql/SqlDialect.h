@@ -94,6 +94,16 @@ public:
 	/// Render a SAMPLE-style "pick any one value" aggregate.
 	virtual std::string anyValueAgg(const std::string &expr) const = 0;
 
+	/// A boolean expression that is true for a negative floating-point value,
+	/// -0.0 included: deduplicating raw DOUBLE values together with it keeps
+	/// -0.0 and 0.0 apart, as their lexical forms are. Empty (the default) when
+	/// the dialect has no such function, in which case floating-point columns
+	/// keep the DISTINCT over their text.
+	virtual std::string floatSignBit(const std::string &expr) const {
+		(void)expr;
+		return std::string();
+	}
+
 	/// Render "the value of `expr` in the row where `orderBy` is smallest
 	/// (`wantMax` false) or largest (true)".
 	///
