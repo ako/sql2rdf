@@ -131,6 +131,10 @@ std::string DuckDbDialect::stringAgg(const std::string &expr, const std::string 
 	return std::string("string_agg(") + (distinct ? "DISTINCT " : "") + expr + ", " + separatorLiteral + ")";
 }
 
+std::string DuckDbDialect::floatSignBit(const std::string &expr) const {
+	return "signbit(" + expr + ")";
+}
+
 std::string DuckDbDialect::anyValueAgg(const std::string &expr) const {
 	return "any_value(" + expr + ")";
 }

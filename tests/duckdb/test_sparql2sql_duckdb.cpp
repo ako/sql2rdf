@@ -2343,13 +2343,18 @@ AggRun runAggregate(DuckDBConnection &conn, const std::string &body, bool withCa
 	return run;
 }
 
-// Native and text paths agree; returns the native run.
+// Native and text paths return the same rows; returns the native run.
 AggRun bothPaths(DuckDBConnection &conn, const std::string &body) {
 	AggRun native = runAggregate(conn, body, true);
 	AggRun text = runAggregate(conn, body, false);
 	INFO("native SQL: " << native.sql);
 	INFO("text SQL: " << text.sql);
-	CHECK(native.rows == text.rows);
+	// The same rows; order may differ where ORDER BY has ties (-0.0 and 0.0).
+	auto a = native.rows;
+	auto b = text.rows;
+	std::sort(a.begin(), a.end());
+	std::sort(b.begin(), b.end());
+	CHECK(a == b);
 	return native;
 }
 
@@ -2408,6 +2413,50 @@ TEST_CASE("native aggregates: grouped, and an OPTIONAL variable keeps COUNT(?x)"
 	REQUIRE(optional.rows.size() == 1);
 	CHECK(optional.rows[0].at("V_N") == "3");
 	CHECK(optional.sql.find("COUNT(*)") == std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Raw-column deduplication: with a catalog and no key, a DISTINCT block over
+// exact-typed columns dedups the raw values and builds the terms afterwards.
+// Same rows as the text path, including the duplicate table row.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("raw dedup: same rows as deduplicating the built terms") {
+	auto conn = makeAggregateDatabase();
+	const std::vector<std::string> queries = {
+	    "SELECT ?m ?q WHERE { ?m ex:qty ?q } ORDER BY ?m",
+	    "SELECT ?m ?c ?o WHERE { ?m ex:code ?c ; ex:owner ?o } ORDER BY ?m",
+	    "SELECT ?m ?p WHERE { ?m ex:price ?p } ORDER BY ?m",
+	    "SELECT ?m ?q ?r WHERE { ?m ex:qty ?q OPTIONAL { ?m ex:ratedbl ?r } } ORDER BY ?m",
+	    "SELECT ?c (COUNT(?m) AS ?n) WHERE { ?m ex:code ?c } GROUP BY ?c ORDER BY ?c",
+	    "SELECT ?x WHERE { { ?x ex:qty ?v } UNION { ?x ex:code ?v } } ORDER BY ?x",
+	    "SELECT ?m ?r WHERE { ?m ex:ratedbl ?r } ORDER BY ?m",
+	};
+	for (const auto &q : queries) {
+		INFO("query: " << q);
+		bothPaths(*conn, q);
+	}
+}
+
+TEST_CASE("raw dedup: used for exact types, and for floating point with the sign bit") {
+	auto conn = makeAggregateDatabase();
+	// Integer, text and an IRI from one integer: dedup on the raw columns.
+	auto exact = bothPaths(*conn, "SELECT ?m ?q ?c ?o WHERE { ?m ex:qty ?q ; ex:code ?c ; ex:owner ?o } ORDER BY ?m");
+	CHECK(exact.sql.find("AS \"r0\"") != std::string::npos);
+	REQUIRE(exact.rows.size() == 3); // the duplicate row once, the NULL row not at all
+	CHECK(exact.rows[0].at("V_M") == "http://ex.org/row/1");
+	CHECK(exact.rows[0].at("V_O") == "http://ex.org/owner/1");
+	// RATE is DOUBLE: -0.0 and 0.0 are one value but two texts, so the sign bit
+	// joins the dedup key and both rows survive, as with the text DISTINCT.
+	conn->execute(
+	    "INSERT INTO AGG_ROWS VALUES (5, 1, 1.00, CAST('-0.0' AS DOUBLE), 'z', 3), (5, 1, 1.00, 0.0, 'z', 3)");
+	auto dbl = bothPaths(*conn, "SELECT ?m ?r WHERE { ?m ex:ratedbl ?r } ORDER BY ?m ?r");
+	CHECK(dbl.sql.find("signbit(") != std::string::npos);
+	int zeros = 0;
+	for (const auto &r : dbl.rows) {
+		zeros += r.at("V_M") == "http://ex.org/row/5" ? 1 : 0;
+	}
+	CHECK(zeros == 2);
 }
 
 // ---------------------------------------------------------------------------
