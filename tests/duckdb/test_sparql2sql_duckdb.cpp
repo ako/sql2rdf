@@ -2807,3 +2807,22 @@ TEST_CASE("closure over raw keys: the recursion, the join above it and the aggre
 	const std::string plain = translateBom(revenue, mapping, nullptr);
 	CHECK(plain.find("cte_k0") == std::string::npos);
 }
+
+TEST_CASE("SUM of xsd:decimal values is an xsd:decimal") {
+	// The value was always summed fixed-point; the datatype must say so too, or
+	// a client reads an exact money total as a double.
+	auto conn = makeSeededDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_decimal.ttl");
+	Parser parser;
+	auto query =
+	    parser.parseString("PREFIX ex: <http://example.com/ns#>\nSELECT (SUM(?x) AS ?s) WHERE { ?p ex:paid ?x }");
+	DuckDbDialect dialect;
+	sparql2sql::TranslateOptions options;
+	options.termTags = true;
+	const std::string sql = translateQuery(*query, mapping, dialect, nullptr, options);
+	INFO("SQL: " << sql);
+	auto rows = collectRows(*conn->execute(sql));
+	REQUIRE(rows.size() == 1);
+	CHECK(rows[0].at("D_S") == "Dhttp://www.w3.org/2001/XMLSchema#decimal");
+}

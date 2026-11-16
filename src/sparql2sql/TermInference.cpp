@@ -96,6 +96,12 @@ TermInfo inferAggregate(const AggregateExpr &agg, const TranslatedPattern &scope
 		return literalOf(xsd::kInteger);
 	case AggregateKind::Sum: {
 		const TermInfo arg = agg.star || !agg.arg ? TermInfo() : infer(*agg.arg, scope);
+		// The emission keeps xsd:decimal fixed-point (ExpressionTranslator's SUM),
+		// and SPARQL's sum of decimals is a decimal; say so, or a client reads an
+		// exact money total as a double.
+		if (arg.datatypeIri == xsd::kDecimal && !arg.isIntegral()) {
+			return literalOf(xsd::kDecimal);
+		}
 		return arithmeticResult(arg, arg);
 	}
 	case AggregateKind::Avg:
