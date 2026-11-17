@@ -431,6 +431,16 @@ void addDomainsAndRanges(r2rml::R2RMLMapping &mapping, std::size_t count, const 
 				domains.insert(d.begin(), d.end());
 				ranges.insert(r.begin(), r.end());
 			}
+			// A domain class this map's own subject map already declares adds
+			// nothing when the triple lands in the same graphs (no graph map on the
+			// predicate-object map): every row with the predicate's object has the
+			// subject, and so the class, already. Skipping it saves a filtered view
+			// that a query for the class would union with the whole table.
+			if (pom.graphMaps.empty()) {
+				for (const auto &c : tm.subjectMap->classIRIs) {
+					domains.erase(c);
+				}
+			}
 			std::set<std::string> pomGraphColumns;
 			if ((domains.empty() && ranges.empty()) || !graphColumns(pom.graphMaps, pomGraphColumns)) {
 				continue;

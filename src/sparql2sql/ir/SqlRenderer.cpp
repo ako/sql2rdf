@@ -11,6 +11,7 @@
 #include "sparql2sql/ExpressionTranslator.h"
 #include "sparql2sql/SqlDialect.h"
 #include "sparql2sql/TagSql.h"
+#include "sparql2sql/TemplateUtil.h"
 #include "sparql2sql/TranslationError.h"
 #include "sparql2sql/TypeCatalog.h"
 #include "sparql2sql/ir/NativeKey.h"
@@ -24,6 +25,20 @@ std::string renderNode(const RelNode &node, TranslationContext &ctx);
 using ExtraProjections = std::vector<std::pair<std::string, std::string>>;
 std::string renderTransitiveClosure(const TransitiveClosureNode &tc, TranslationContext &ctx,
                                     const ExtraProjections *extra);
+std::size_t closureArmCount(const TransitiveClosureNode &tc);
+// The start set of a seeded pairs closure (see renderJoin): a CTE holding the
+// join partner's values for one endpoint, as IRI text and, when the partner
+// column is a template, as its raw placeholder columns too.
+struct ClosureSeed {
+	std::string cte;
+	std::string iriCol;               // mangled endpoint variable in `cte`
+	std::vector<std::string> keyCols; // raw placeholder columns in `cte`, may be empty
+	const ColumnInfo *col = nullptr;  // the partner's column for the endpoint
+	bool onFrom = true;               // seeds the subject end (else the object end)
+};
+
+std::string renderSplitClosure(const TransitiveClosureNode &tc, TranslationContext &ctx, const ClosureSeed *seed,
+                               const ColumnInfo *outCol = nullptr, std::size_t *outKeys = nullptr);
 
 // A TranslatedPattern carrying a node's schema *description* but no SQL -
 // enough for translateExpression's in-scope/optionality checks and its static
@@ -509,7 +524,174 @@ std::string renderChild(const RelNode &node, TranslationContext &ctx, const Extr
 	return renderNode(node, ctx);
 }
 
-std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
+// A seeded pairs closure (magic sets): `?x :p+ ?y` with both ends variable
+// is a closure over every pair, but joined to a partner that binds ?x (or ?y)
+// only the pairs starting (or ending) at the partner's values can survive. So
+// the partner is rendered once as a CTE, the closure walks from its distinct
+// values (renderSplitClosure with a ClosureSeed), and the join reads both.
+// Returns the closure's SQL, or "" when the join does not have that shape or the
+// closure cannot be seeded; `partnerSql` then holds nothing.
+std::string seededClosure(const RelNode &left, const RelNode &right, const std::vector<EquiKey> &keys, JoinKind kind,
+                          TranslationContext &ctx, bool &closureOnRight, std::string &partnerSql,
+                          std::size_t &startKeys, std::string &seedVar) {
+	startKeys = 0;
+	if (kind != JoinKind::Inner) {
+		return std::string();
+	}
+	const RelNode *tcNode = nullptr;
+	const RelNode *partner = nullptr;
+	if (right.kind() == RelKind::TransitiveClosure) {
+		tcNode = &right;
+		partner = &left;
+		closureOnRight = true;
+	} else if (left.kind() == RelKind::TransitiveClosure) {
+		tcNode = &left;
+		partner = &right;
+		closureOnRight = false;
+	} else {
+		return std::string();
+	}
+	const auto &tc = static_cast<const TransitiveClosureNode &>(*tcNode);
+	if (tc.mode != TransitiveClosureNode::Mode::BothVars || tc.sameEndpointVar || !tc.invariantVars.empty() ||
+	    tc.schema().size() < 2) {
+		return std::string();
+	}
+	// Seed the end the partner binds in every row; prefer the subject end.
+	const ColumnInfo *seedCol = nullptr;
+	bool onFrom = true;
+	for (int end = 0; end < 2 && seedCol == nullptr; ++end) {
+		const ColumnInfo *c = partner->column(tc.schema()[end].var);
+		bool keyed = false;
+		for (const auto &k : keys) {
+			keyed = keyed || (k.var == tc.schema()[end].var && !k.nullSafe);
+		}
+		if (c != nullptr && c->nonNull && keyed) {
+			seedCol = c;
+			onFrom = end == 0;
+		}
+	}
+	if (seedCol == nullptr) {
+		return std::string();
+	}
+	seedVar = seedCol->var;
+	const SqlDialect &dialect = ctx.dialect();
+	ClosureSeed seed;
+	seed.cte = ctx.nextCteName();
+	seed.iriCol = mangleVar(seedCol->var, dialect);
+	seed.col = seedCol;
+	seed.onFrom = onFrom;
+	ExtraProjections seedKeys;
+	if (partner->kind() == RelKind::Spj && seedCol->prov == Provenance::TemplateExpr && seedCol->templateInvertible) {
+		for (const auto &ref : seedCol->templateColumnRefs) {
+			const std::string name = dialect.quoteIdentifier("sk_" + std::to_string(seedKeys.size()));
+			seedKeys.emplace_back(name, ref);
+			seed.keyCols.push_back(name);
+		}
+	}
+	std::string cteSql = renderChild(*partner, ctx, seedKeys);
+	ctx.addCte(seed.cte, cteSql);
+	std::string closureSql = renderSplitClosure(tc, ctx, &seed, nullptr, &startKeys);
+	if (closureSql.empty()) {
+		// Not seedable after all: still read the partner from its CTE.
+		closureSql = renderNode(tc, ctx);
+		startKeys = 0;
+	}
+	partnerSql = "SELECT * FROM " + seed.cte;
+	return closureSql;
+}
+
+// A unary closure (one end anchored) joined to a scan on the node it reaches:
+// render the closure restricted to what the scan's template can meet, and join
+// on raw key columns when every remaining part carries them. A question about
+// districts then never scans the address links below them, and a question
+// about addresses joins them on their keys, not on built IRI text.
+// Closure output already rendered for one union arm, by partner template, so
+// the other arms of a distributed join (renderJoin) read the same CTE.
+using ClosureMemo = std::map<std::string, std::pair<std::string, std::size_t>>;
+
+bool closureKeyJoin(const RelNode &left, const RelNode &right, const std::vector<EquiKey> &keys, JoinKind kind,
+                    TranslationContext &ctx, const std::string &leftAlias, const std::string &rightAlias,
+                    std::string &leftSql, std::string &rightSql, std::vector<std::string> &nativeConds,
+                    std::vector<bool> &rewritten, std::set<std::string> &fromRight, ClosureMemo *memo) {
+	if (kind != JoinKind::Inner) {
+		return false;
+	}
+	const bool tcRight = right.kind() == RelKind::TransitiveClosure;
+	const RelNode &tcNode = tcRight ? right : left;
+	const RelNode &partner = tcRight ? left : right;
+	if (tcNode.kind() != RelKind::TransitiveClosure || partner.kind() != RelKind::Spj) {
+		return false;
+	}
+	const auto &tc = static_cast<const TransitiveClosureNode &>(tcNode);
+	if (tc.mode != TransitiveClosureNode::Mode::ForwardFromSubject &&
+	    tc.mode != TransitiveClosureNode::Mode::BackwardFromObject) {
+		return false;
+	}
+	if (tc.schema().empty()) {
+		return false;
+	}
+	const std::string &var = tc.schema()[0].var;
+	std::size_t keyIndex = keys.size();
+	for (std::size_t i = 0; i < keys.size(); ++i) {
+		if (keys[i].var == var && !keys[i].nullSafe) {
+			keyIndex = i;
+		}
+	}
+	const ColumnInfo *outCol = partner.column(var);
+	if (keyIndex == keys.size() || outCol == nullptr) {
+		return false;
+	}
+	std::size_t nOut = 0;
+	std::string tcSql;
+	const std::string memoKey = outCol->templateString + "|" + std::to_string(outCol->templateColumnRefs.size());
+	if (memo != nullptr && memo->count(memoKey) != 0) {
+		tcSql = "SELECT * FROM " + (*memo)[memoKey].first;
+		nOut = (*memo)[memoKey].second;
+	} else {
+		{
+			TranslationContext::SubqueryDepthGuard depthGuard(ctx);
+			tcSql = renderSplitClosure(tc, ctx, nullptr, outCol, &nOut);
+		}
+		if (tcSql.empty()) {
+			return false;
+		}
+		if (memo != nullptr) {
+			const std::string cte = ctx.nextCteName();
+			ctx.addCte(cte, tcSql);
+			(*memo)[memoKey] = std::make_pair(cte, nOut);
+			tcSql = "SELECT * FROM " + cte;
+		}
+	}
+	const SqlDialect &dialect = ctx.dialect();
+	ExtraProjections partnerExtra;
+	rewritten.assign(keys.size(), false);
+	if (nOut > 0) {
+		const std::string &pAlias = tcRight ? leftAlias : rightAlias;
+		const std::string &tAlias = tcRight ? rightAlias : leftAlias;
+		for (std::size_t i = 0; i < nOut; ++i) {
+			const std::string name = dialect.quoteIdentifier("ok_" + std::to_string(i));
+			partnerExtra.emplace_back(name, outCol->templateColumnRefs[i]);
+			nativeConds.push_back(pAlias + "." + name + " = " + tAlias + "." + name);
+		}
+		rewritten[keyIndex] = true;
+		// Take the term from the closure side, which built it for the joined rows
+		// only; the scan's own term column is then unused and never computed.
+		if (tcRight) {
+			fromRight.insert(var);
+		}
+	}
+	std::string partnerSql;
+	{
+		TranslationContext::SubqueryDepthGuard depthGuard(ctx);
+		partnerSql = renderChild(partner, ctx, partnerExtra);
+	}
+	leftSql = tcRight ? partnerSql : tcSql;
+	rightSql = tcRight ? tcSql : partnerSql;
+	return true;
+}
+
+std::string renderJoinParts(const RelNode &left, const RelNode &right, const std::vector<EquiKey> &keys, JoinKind kind,
+                            TranslationContext &ctx, ClosureMemo *memo = nullptr) {
 	const SqlDialect &dialect = ctx.dialect();
 	std::string leftAlias = ctx.nextAlias();
 	std::string rightAlias = ctx.nextAlias();
@@ -518,27 +700,55 @@ std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
 	ExtraProjections rightExtra;
 	std::vector<std::string> nativeConds;
 	std::vector<bool> rewritten;
-	planNativeKeys(join.keys, *join.left, *join.right, ctx, leftAlias, rightAlias, leftExtra, rightExtra, nativeConds,
-	               rewritten);
-
 	std::string leftSql;
 	std::string rightSql;
+	bool closureOnRight = false;
+	std::string partnerSql;
+	std::string closureSql;
+	std::set<std::string> fromRight; // shared variables projected from the right side
+	std::size_t startKeys = 0;
+	std::string seedVar;
 	{
 		TranslationContext::SubqueryDepthGuard depthGuard(ctx);
-		leftSql = renderChild(*join.left, ctx, leftExtra);
-		rightSql = renderChild(*join.right, ctx, rightExtra);
+		closureSql = seededClosure(left, right, keys, kind, ctx, closureOnRight, partnerSql, startKeys, seedVar);
+	}
+	if (!closureSql.empty()) {
+		// Seeded: the closure is already narrowed to the partner's values. It
+		// meets the partner on the start's raw keys when it carried them (and the
+		// start's term then comes from the partner), else on term text.
+		rewritten.assign(keys.size(), false);
+		for (std::size_t i = 0; i < keys.size() && startKeys > 0; ++i) {
+			if (keys[i].var == seedVar) {
+				rewritten[i] = true;
+				for (std::size_t k = 0; k < startKeys; ++k) {
+					const std::string col = dialect.quoteIdentifier("sk_" + std::to_string(k));
+					nativeConds.push_back(leftAlias + "." + col + " = " + rightAlias + "." + col);
+				}
+				if (!closureOnRight) {
+					fromRight.insert(seedVar);
+				}
+			}
+		}
+		leftSql = closureOnRight ? partnerSql : closureSql;
+		rightSql = closureOnRight ? closureSql : partnerSql;
+	} else if (!closureKeyJoin(left, right, keys, kind, ctx, leftAlias, rightAlias, leftSql, rightSql, nativeConds,
+	                           rewritten, fromRight, memo)) {
+		planNativeKeys(keys, left, right, ctx, leftAlias, rightAlias, leftExtra, rightExtra, nativeConds, rewritten);
+		TranslationContext::SubqueryDepthGuard depthGuard(ctx);
+		leftSql = renderChild(left, ctx, leftExtra);
+		rightSql = renderChild(right, ctx, rightExtra);
 	}
 
 	std::set<std::string> shared;
-	for (const auto &k : join.keys) {
+	for (const auto &k : keys) {
 		shared.insert(k.var);
 	}
 
 	std::vector<std::string> onConditions;
 	std::vector<std::string> projectExprs;
-	projectExprs.reserve(join.schema().size() + join.keys.size() * 2);
-	for (std::size_t i = 0; i < join.keys.size(); ++i) {
-		const EquiKey &k = join.keys[i];
+	projectExprs.reserve(left.schema().size() + right.schema().size() + keys.size() * 2);
+	for (std::size_t i = 0; i < keys.size(); ++i) {
+		const EquiKey &k = keys[i];
 		std::string lcol = leftAlias + "." + mangleVar(k.var, dialect);
 		std::string rcol = rightAlias + "." + mangleVar(k.var, dialect);
 		if (!rewritten[i]) {
@@ -554,7 +764,7 @@ std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
 		if (k.nullSafe) {
 			projectExprs.push_back("COALESCE(" + lcol + ", " + rcol + ") AS " + mangleVar(k.var, dialect));
 		} else {
-			projectExprs.push_back(lcol + " AS " + mangleVar(k.var, dialect));
+			projectExprs.push_back((fromRight.count(k.var) != 0 ? rcol : lcol) + " AS " + mangleVar(k.var, dialect));
 		}
 		if (ctx.needsTag(k.var)) {
 			const std::string ltag = leftAlias + "." + mangleVarTag(k.var, dialect);
@@ -563,12 +773,13 @@ std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
 			// the constant-tag case in mergeInner: a child's tag column is NULL
 			// precisely when its value column is, so COALESCE picks the tag from
 			// the same side the value came from.
-			projectExprs.push_back((k.nullSafe ? ("COALESCE(" + ltag + ", " + rtag + ")") : ltag) + " AS " +
-			                       mangleVarTag(k.var, dialect));
+			projectExprs.push_back(
+			    (k.nullSafe ? ("COALESCE(" + ltag + ", " + rtag + ")") : (fromRight.count(k.var) != 0 ? rtag : ltag)) +
+			    " AS " + mangleVarTag(k.var, dialect));
 		}
 	}
 	onConditions.insert(onConditions.end(), nativeConds.begin(), nativeConds.end());
-	for (const auto &v : join.left->allVars()) {
+	for (const auto &v : left.allVars()) {
 		if (shared.count(v)) {
 			continue;
 		}
@@ -577,7 +788,7 @@ std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
 			projectExprs.push_back(leftAlias + "." + mangleVarTag(v, dialect) + " AS " + mangleVarTag(v, dialect));
 		}
 	}
-	for (const auto &v : join.right->allVars()) {
+	for (const auto &v : right.allVars()) {
 		if (shared.count(v)) {
 			continue;
 		}
@@ -589,8 +800,7 @@ std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
 
 	// A native-aggregate block below this join (see Translator.cpp): pass its
 	// n_<var> companions up, so the aggregate above reads table values.
-	for (const auto &child :
-	     {std::make_pair(join.left.get(), &leftAlias), std::make_pair(join.right.get(), &rightAlias)}) {
+	for (const auto &child : {std::make_pair(&left, &leftAlias), std::make_pair(&right, &rightAlias)}) {
 		if (ctx.nativeRoot() == child.first) {
 			for (const auto &n : ctx.nativeRootExprs()) {
 				const std::string col = mangleVarNative(n.first, dialect);
@@ -607,7 +817,7 @@ std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
 	} else {
 		sql += joinColumnList(projectExprs, ctx);
 	}
-	const char *keyword = join.joinKind == JoinKind::LeftOuter ? "LEFT OUTER JOIN" : "INNER JOIN";
+	const char *keyword = kind == JoinKind::LeftOuter ? "LEFT OUTER JOIN" : "INNER JOIN";
 	sql += ctx.clauseSep() + "FROM (" + leftSql + ") AS " + leftAlias;
 	sql += ctx.clauseSep() + keyword + " (" + rightSql + ") AS " + rightAlias;
 	sql += ctx.onSep() + "ON ";
@@ -617,6 +827,50 @@ std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
 		sql += joinConditions(onConditions, ctx);
 	}
 	return sql;
+}
+
+// A closure joined to a union of scans: join each arm separately, so the arms
+// are narrowed by the closure (and joined on keys where they can be) before
+// their union removes duplicates, instead of after.
+// (A u B) JOIN T = (A JOIN T) u (B JOIN T), for bag and set unions alike.
+std::string renderJoin(const JoinNode &join, TranslationContext &ctx) {
+	if (join.joinKind == JoinKind::Inner) {
+		const bool tcRight = join.right->kind() == RelKind::TransitiveClosure;
+		const bool tcLeft = join.left->kind() == RelKind::TransitiveClosure;
+		const RelNode *other = tcRight ? join.left.get() : (tcLeft ? join.right.get() : nullptr);
+		// Only a one-end-anchored closure whose step mixes templates: that is
+		// what closureKeyJoin narrows per arm (sharing one rendering). Any other
+		// closure would just be rendered again for every arm.
+		const RelNode *tcSide = tcRight ? join.right.get() : join.left.get();
+		bool splittable = false;
+		if (other != nullptr) {
+			const auto &tc = static_cast<const TransitiveClosureNode &>(*tcSide);
+			splittable = (tc.mode == TransitiveClosureNode::Mode::ForwardFromSubject ||
+			              tc.mode == TransitiveClosureNode::Mode::BackwardFromObject) &&
+			             closureArmCount(tc) >= 2;
+		}
+		if (other != nullptr && splittable && other->kind() == RelKind::UnionByName) {
+			const auto &un = static_cast<const UnionByNameNode &>(*other);
+			bool armsOk = !un.arms.empty();
+			for (const auto &arm : un.arms) {
+				armsOk = armsOk && arm->kind() == RelKind::Spj;
+				for (const auto &k : join.keys) {
+					armsOk = armsOk && arm->column(k.var) != nullptr && !k.nullSafe;
+				}
+			}
+			if (armsOk) {
+				std::vector<std::string> parts;
+				parts.reserve(un.arms.size());
+				ClosureMemo memo;
+				for (const auto &arm : un.arms) {
+					parts.push_back(tcRight ? renderJoinParts(*arm, *join.right, join.keys, join.joinKind, ctx, &memo)
+					                        : renderJoinParts(*join.left, *arm, join.keys, join.joinKind, ctx, &memo));
+				}
+				return ctx.dialect().combineByName(un.all, parts);
+			}
+		}
+	}
+	return renderJoinParts(*join.left, *join.right, join.keys, join.joinKind, ctx);
 }
 
 std::string renderAntiJoin(const AntiJoinNode &anti, TranslationContext &ctx) {
@@ -727,6 +981,724 @@ std::string renderBind(const BindNode &b, TranslationContext &ctx) {
 	       "FROM (" + childSql + ") AS " + alias;
 }
 
+// ---------------------------------------------------------------------------
+// Closures whose step mixes templates: recurse only where a hop can follow.
+//
+// A transitive property often links two kinds of thing: addresses to their
+// neighbourhood and regions to their parent region, under one nl:liesIn. The
+// step relation is then a union of arms with different templates, so the
+// closure cannot recurse on keys, and the recursion drags every address link
+// through every iteration, building IRI text for all of them.
+//
+// But an address IRI is never the object of a liesIn link, so an address link
+// can only ever be the first hop of a path: liesIn+ = regions+ u addressLink u
+// addressLink/regions+. In general, judged per arm from its two templates
+// (templatesCanEverMatch):
+//  - a *leaf* arm lands on a node no arm walks on: it can only be the last hop;
+//  - a *start* arm walks from a node no arm lands on: it can only be the first;
+//  - every other arm is a *core* arm, and only core arms recurse.
+// Leaf and start arms are then joined once, outside the recursion, and the
+// core usually has one template at both ends, so it recurses on raw keys.
+// A constant anchor is compared on the raw columns it implies
+// (invertTemplate), so no arm builds IRI text for rows it does not return.
+// ---------------------------------------------------------------------------
+
+struct ClosureArm {
+	const SpjRelation *arm = nullptr;
+	const ColumnInfo *from = nullptr;
+	const ColumnInfo *to = nullptr;
+};
+
+bool armTemplated(const ColumnInfo *c) {
+	return c != nullptr && c->prov == Provenance::TemplateExpr && !c->templateString.empty();
+}
+
+// The step's arms, or empty when any arm is not a templated SPJ block (then
+// the split proves nothing and the closure renders as before).
+std::vector<ClosureArm> closureArms(const TransitiveClosureNode &tc) {
+	std::vector<ClosureArm> arms;
+	auto add = [&](const RelNode &n) {
+		if (n.kind() != RelKind::Spj) {
+			return false;
+		}
+		ClosureArm a;
+		a.arm = &static_cast<const SpjRelation &>(n);
+		a.from = n.column(tc.fromVar);
+		a.to = n.column(tc.toVar);
+		if (!armTemplated(a.from) || !armTemplated(a.to)) {
+			return false;
+		}
+		arms.push_back(a);
+		return true;
+	};
+	if (tc.step == nullptr) {
+		return arms;
+	}
+	if (tc.step->kind() == RelKind::UnionByName) {
+		for (const auto &arm : static_cast<const UnionByNameNode &>(*tc.step).arms) {
+			if (!add(*arm)) {
+				return {};
+			}
+		}
+	} else if (!add(*tc.step)) {
+		return {};
+	}
+	return arms;
+}
+
+// How many templated SPJ arms the closure's step has (0 when any arm is not one).
+std::size_t closureArmCount(const TransitiveClosureNode &tc) {
+	return closureArms(tc).size();
+}
+
+// "SELECT <cols> FROM <arm sources>[, <extraFrom>] WHERE <arm conds> AND <extraConds>",
+// with every expression in the arm's own scope. The arm's DISTINCT is dropped:
+// every caller feeds a deduplicating UNION.
+std::string armSelect(const SpjRelation &arm, const std::vector<std::string> &cols, const std::string &extraFrom,
+                      const std::vector<std::string> &extraConds) {
+	std::string sql = "SELECT ";
+	for (std::size_t i = 0; i < cols.size(); ++i) {
+		sql += (i > 0 ? ", " : "") + cols[i];
+	}
+	sql += " FROM ";
+	for (std::size_t i = 0; i < arm.sources.size(); ++i) {
+		sql += (i > 0 ? ", " : "") + arm.sources[i].sql;
+	}
+	if (!extraFrom.empty()) {
+		sql += ", " + extraFrom;
+	}
+	std::vector<std::string> conds;
+	conds.reserve(arm.whereConds.size() + extraConds.size());
+	for (const auto &c : arm.whereConds) {
+		conds.push_back("(" + c + ")");
+	}
+	for (const auto &c : extraConds) {
+		conds.push_back("(" + c + ")");
+	}
+	if (!conds.empty()) {
+		sql += " WHERE ";
+		for (std::size_t i = 0; i < conds.size(); ++i) {
+			sql += (i > 0 ? " AND " : "") + conds[i];
+		}
+	}
+	return sql;
+}
+
+// The text of a SQL string literal ('it''s' -> it's).
+std::string unquoteLiteral(const std::string &literal) {
+	if (literal.size() < 2 || literal.front() != '\'' || literal.back() != '\'') {
+		return literal;
+	}
+	std::string out;
+	for (std::size_t i = 1; i + 1 < literal.size(); ++i) {
+		out += literal[i];
+		if (literal[i] == '\'' && i + 2 < literal.size() && literal[i + 1] == '\'') {
+			++i;
+		}
+	}
+	return out;
+}
+
+// The condition that an arm's end column equals a constant IRI: equalities on
+// the raw placeholder columns when the template splits it, FALSE when it cannot
+// produce it, the built term otherwise.
+std::string anchorCondition(const ColumnInfo &col, const std::string &anchorLiteral, const SqlDialect &dialect) {
+	if (col.templateInvertible && !col.templateColumnRefs.empty() &&
+	    col.templateColumnRefs.size() == col.templateColumnNames.size()) {
+		const bool iri = col.term.kind == RdfTermKind::Iri;
+		InversionOutcome inv = invertTemplate(parseTemplate(col.templateString), unquoteLiteral(anchorLiteral),
+		                                      /*percentDecodeValues=*/iri);
+		if (inv.kind == InversionKind::NeverMatches) {
+			return dialect.booleanLiteral(false);
+		}
+		if (inv.kind == InversionKind::PerColumnMatch && inv.columnValues.size() == col.templateColumnRefs.size()) {
+			std::string cond;
+			for (std::size_t i = 0; i < inv.columnValues.size(); ++i) {
+				// The template rendered CAST(col AS VARCHAR), so compare that text:
+				// a typed comparison could fail to cast a non-numeric value.
+				cond += (i > 0 ? " AND " : "") + std::string("CAST(") + col.templateColumnRefs[i] +
+				        " AS VARCHAR) = " + dialect.stringLiteral(inv.columnValues[i].second);
+			}
+			return cond;
+		}
+	}
+	return col.renderedExpr + " = " + anchorLiteral;
+}
+
+// Render a closure whose step mixes templates (see the section comment), or
+// return "" when the split does not apply and the plain closure should be used.
+// With `seed`, a pairs closure walks only from the seed's values. With
+// `outCol` (a unary closure's join partner column for the reached node), arms
+// whose landing template the partner can never match are left out of the
+// output, and when every remaining part lands in the partner's template shape
+// the output also carries the raw placeholder columns as ok_0.. (*outKeys says
+// how many; 0 when not exposed).
+std::string renderSplitClosure(const TransitiveClosureNode &tc, TranslationContext &ctx, const ClosureSeed *seed,
+                               const ColumnInfo *outCol, std::size_t *outKeys) {
+	if (outKeys != nullptr) {
+		*outKeys = 0;
+	}
+	if (!tc.invariantVars.empty() || tc.sameEndpointVar) {
+		return std::string();
+	}
+	const std::vector<ClosureArm> arms = closureArms(tc);
+	if (arms.size() < (seed != nullptr ? 1U : 2U)) {
+		return std::string();
+	}
+	const SqlDialect &dialect = ctx.dialect();
+	const TypeCatalog *catalog = ctx.catalog();
+
+	// fromSide: the arm's `from` end (else its `to` end).
+	auto end = [](const ClosureArm &a, bool fromSide) {
+		return fromSide ? a.from : a.to;
+	};
+	// Can some arm's `otherSide` end ever equal this end of `a`?
+	auto meets = [&](const ClosureArm &a, bool fromSide) {
+		for (const auto &b : arms) {
+			if (templatesCanEverMatch(end(a, fromSide)->templateString, end(b, !fromSide)->templateString)) {
+				return true;
+			}
+		}
+		return false;
+	};
+
+	const bool bothVars = tc.mode == TransitiveClosureNode::Mode::BothVars && seed == nullptr;
+	// Walk direction: forward walks from -> to. A pairs closure is split along
+	// whichever direction has single-hop arms (entry arms first: their `from`
+	// meets no `to`, as addresses below a region hierarchy).
+	bool forward = seed != nullptr ? seed->onFrom : tc.mode != TransitiveClosureNode::Mode::BackwardFromObject;
+	if (bothVars) {
+		bool anyEntry = false;
+		bool anyExit = false;
+		for (const auto &a : arms) {
+			anyEntry = anyEntry || !meets(a, /*fromSide=*/true);
+			anyExit = anyExit || !meets(a, /*fromSide=*/false);
+		}
+		if (!anyEntry && !anyExit) {
+			return std::string();
+		}
+		forward = !anyEntry; // entry arms are leaves when walking backward
+	}
+	// Walking end / landing end of an arm in this direction.
+	auto walk = [&](const ClosureArm &a) {
+		return forward ? a.from : a.to;
+	};
+	auto land = [&](const ClosureArm &a) {
+		return forward ? a.to : a.from;
+	};
+
+	std::vector<ClosureArm> core;
+	std::vector<ClosureArm> leaf;  // lands where no arm walks: last hop only
+	std::vector<ClosureArm> start; // walks where no arm lands: first hop only (and not a leaf)
+	for (const auto &a : arms) {
+		const bool isLeaf = !meets(a, /*fromSide=*/!forward);
+		const bool isStart = !meets(a, /*fromSide=*/forward);
+		if (isLeaf) {
+			leaf.push_back(a);
+		} else if (isStart) {
+			start.push_back(a);
+		} else {
+			core.push_back(a);
+		}
+	}
+	if (leaf.empty() && start.empty() && seed == nullptr) {
+		return std::string();
+	}
+	if (bothVars && !start.empty()) {
+		return std::string(); // a pairs closure is split on leaf arms only
+	}
+
+	// Core node keys: the template placeholders, when every core arm's two ends
+	// share core[0]'s landing shape over comparable columns.
+	const ColumnInfo *ref = core.empty() ? nullptr : land(core[0]);
+	std::size_t nKeys = 0;
+	if (ref != nullptr) {
+		nKeys = nativeKeyPairs(*ref, *ref, catalog).size();
+		for (const auto &a : core) {
+			if (nativeKeyPairs(*a.from, *ref, catalog).size() != nKeys ||
+			    nativeKeyPairs(*a.to, *ref, catalog).size() != nKeys) {
+				nKeys = 0;
+				break;
+			}
+		}
+	}
+	// Seeds landing from start arms must land in the core's key space too.
+	if (nKeys > 0) {
+		for (const auto &a : start) {
+			if (nativeKeyPairs(*land(a), *ref, catalog).size() != nKeys) {
+				nKeys = 0;
+			}
+		}
+	}
+	auto keyName = [&](const std::string &prefix, std::size_t i) {
+		return dialect.quoteIdentifier(prefix + std::to_string(i));
+	};
+	// "<ref0> AS k0, ..." for one end of an arm, in its own scope.
+	auto keyCols = [&](const ColumnInfo &c, const std::string &prefix) {
+		std::vector<std::string> cols;
+		if (nKeys == 0) {
+			return cols;
+		}
+		for (const auto &p : nativeKeyPairs(c, *ref, catalog)) {
+			cols.push_back(p.leftRef + " AS " + keyName(prefix, cols.size()));
+		}
+		return cols;
+	};
+	// Join one arm end (own scope) to a closure node row `alias` with key prefix
+	// `prefix` (or its IRI column `iriCol`).
+	auto nodeJoin = [&](const ColumnInfo &c, const std::string &alias, const std::string &prefix,
+	                    const std::string &iriCol) {
+		std::vector<NativeKeyPair> pairs = nKeys > 0 ? nativeKeyPairs(c, *ref, catalog) : std::vector<NativeKeyPair>();
+		if (pairs.size() != nKeys || nKeys == 0) {
+			return c.renderedExpr + " = " + alias + "." + iriCol;
+		}
+		std::string cond;
+		for (std::size_t i = 0; i < pairs.size(); ++i) {
+			cond += (i > 0 ? " AND " : "") + pairs[i].leftRef + " = " + alias + "." + keyName(prefix, i);
+		}
+		return cond;
+	};
+	auto unionOf = [](const std::vector<std::string> &parts) {
+		std::string sql;
+		for (std::size_t i = 0; i < parts.size(); ++i) {
+			sql += (i > 0 ? " UNION " : "") + std::string("(") + parts[i] + ")";
+		}
+		return sql;
+	};
+
+	// Whether arm `a`'s first hop can start from a seed value at all.
+	auto seedCanMeet = [&](const ClosureArm &a) {
+		return seed == nullptr || seed->col == nullptr || seed->col->templateString.empty() ||
+		       templatesCanEverMatch(walk(a)->templateString, seed->col->templateString);
+	};
+	const std::string node = dialect.quoteIdentifier("cte_node");
+	const std::string sFrom = dialect.quoteIdentifier("s_from");
+	const std::string sTo = dialect.quoteIdentifier("s_to");
+
+	// The core step: both ends' IRIs, and their keys (kf/kt) when keyed.
+	std::string coreCte;
+	if (!core.empty()) {
+		std::vector<std::string> parts;
+		for (const auto &a : core) {
+			std::vector<std::string> cols = {a.from->renderedExpr + " AS " + sFrom, a.to->renderedExpr + " AS " + sTo};
+			for (auto &k : keyCols(*a.from, "kf")) {
+				cols.push_back(k);
+			}
+			for (auto &k : keyCols(*a.to, "kt")) {
+				cols.push_back(k);
+			}
+			parts.push_back(armSelect(*a.arm, cols, "", {}));
+		}
+		coreCte = ctx.nextCteName();
+		std::string sql;
+		for (std::size_t i = 0; i < parts.size(); ++i) {
+			sql += (i > 0 ? " UNION ALL " : "") + std::string("(") + parts[i] + ")";
+		}
+		ctx.addCte(coreCte, sql);
+	}
+	const std::string walkCol = forward ? sFrom : sTo;
+	const std::string landCol = forward ? sTo : sFrom;
+	const std::string walkKey = forward ? "kf" : "kt";
+	const std::string landKey = forward ? "kt" : "kf";
+	auto carried = [&](const std::string &alias, const std::string &prefix, bool rename) {
+		std::string out;
+		for (std::size_t i = 0; i < nKeys; ++i) {
+			out += ", " + alias + "." + keyName(prefix, i) + (rename ? " AS " + keyName("k", i) : "");
+		}
+		return out;
+	};
+	auto coreHop = [&](const std::string &acc, const std::string &step) {
+		if (nKeys == 0) {
+			return acc + "." + node + " = " + step + "." + walkCol;
+		}
+		std::string cond;
+		for (std::size_t i = 0; i < nKeys; ++i) {
+			cond += (i > 0 ? " AND " : "") + acc + "." + keyName("k", i) + " = " + step + "." + keyName(walkKey, i);
+		}
+		return cond;
+	};
+
+	if (!bothVars && seed != nullptr && !seed->keyCols.empty() && nKeys > 0) {
+		// A seeded closure over keys: carry the start's raw columns (s0..) and the
+		// node's (k0..) through the recursion instead of their IRI text, build the
+		// reached node's IRI once at the end, and hand the start keys to the join
+		// (as sk0.., the partner CTE's names), which takes the start term from the
+		// partner. Applies when every first hop meets the seed on raw columns and
+		// every leaf arm walks from the core's key space.
+		const std::size_t nSeed = seed->keyCols.size();
+		bool keyed = true;
+		for (const auto *group : {&core, &start, &leaf}) {
+			for (const auto &a : *group) {
+				keyed = keyed && (!seedCanMeet(a) || nativeKeyPairs(*walk(a), *seed->col, catalog).size() == nSeed);
+			}
+		}
+		for (const auto &a : leaf) {
+			keyed = keyed && nativeKeyPairs(*walk(a), *ref, catalog).size() == nKeys;
+		}
+		if (keyed) {
+			auto sCol = [&](std::size_t i) {
+				return keyName("s", i);
+			};
+			auto skCol = [&](std::size_t i) {
+				return dialect.quoteIdentifier("sk_" + std::to_string(i));
+			};
+			std::string seedSrc = "(SELECT DISTINCT ";
+			for (std::size_t i = 0; i < nSeed; ++i) {
+				seedSrc += (i > 0 ? ", " : "") + seed->keyCols[i];
+			}
+			seedSrc += " FROM " + seed->cte + ")";
+			// One first hop of arm `a`: the seed's columns, `landCols`, the raw join.
+			auto firstHop = [&](const ClosureArm &a, const std::vector<std::string> &landCols) {
+				const std::string sd = ctx.nextAlias();
+				std::vector<NativeKeyPair> pairs = nativeKeyPairs(*walk(a), *seed->col, catalog);
+				std::vector<std::string> cols;
+				std::string cond;
+				for (std::size_t i = 0; i < nSeed; ++i) {
+					cols.push_back(sd + "." + seed->keyCols[i] + " AS " + sCol(i));
+					cond += (i > 0 ? " AND " : "") + pairs[i].leftRef + " = " + sd + "." + seed->keyCols[i];
+				}
+				cols.insert(cols.end(), landCols.begin(), landCols.end());
+				return armSelect(*a.arm, cols, seedSrc + " AS " + sd, {cond});
+			};
+			std::vector<std::string> seeds;
+			for (const auto *group : {&core, &start}) {
+				for (const auto &a : *group) {
+					if (seedCanMeet(a)) {
+						seeds.push_back(firstHop(a, keyCols(*land(a), "k")));
+					}
+				}
+			}
+			std::string sCarry;
+			for (std::size_t i = 0; i < nSeed; ++i) {
+				sCarry += "%A%." + sCol(i) + ", ";
+			}
+			auto carryS = [&](const std::string &alias) {
+				std::string out = sCarry;
+				for (std::size_t pos = out.find("%A%"); pos != std::string::npos; pos = out.find("%A%", pos)) {
+					out.replace(pos, 3, alias);
+				}
+				return out;
+			};
+			std::vector<std::string> nodes;
+			std::string closureCte;
+			if (!seeds.empty()) {
+				closureCte = ctx.nextCteName();
+				std::string r = ctx.nextAlias();
+				std::string st = ctx.nextAlias();
+				std::string recursive;
+				if (!core.empty()) {
+					std::string landKeys;
+					for (std::size_t i = 0; i < nKeys; ++i) {
+						landKeys += (i > 0 ? ", " : "") + st + "." + keyName(landKey, i);
+					}
+					recursive = " UNION SELECT " + carryS(r) + landKeys + " FROM " + closureCte + " AS " + r +
+					            " JOIN " + coreCte + " AS " + st + " ON " + coreHop(r, st);
+				}
+				ctx.addCte(closureCte, "SELECT * FROM (" + unionOf(seeds) + ")" + recursive);
+				// The reached node's IRI, built from its keys.
+				const std::string c = ctx.nextAlias();
+				std::string iri = ref->renderedExpr;
+				for (std::size_t i = 0; i < nKeys; ++i) {
+					iri = replaceRef(iri, ref->templateColumnRefs[i], c + "." + keyName("k", i));
+				}
+				nodes.push_back("SELECT " + carryS(c) + iri + " AS " + node + " FROM " + closureCte + " AS " + c);
+			}
+			for (const auto &a : leaf) {
+				const std::vector<std::string> cols = {land(a)->renderedExpr + " AS " + node};
+				if (seedCanMeet(a)) {
+					nodes.push_back(firstHop(a, cols));
+				}
+				if (!closureCte.empty()) {
+					const std::string c = ctx.nextAlias();
+					std::vector<std::string> leafCols;
+					for (std::size_t i = 0; i < nSeed; ++i) {
+						leafCols.push_back(c + "." + sCol(i));
+					}
+					leafCols.push_back(cols[0]);
+					nodes.push_back(
+					    armSelect(*a.arm, leafCols, closureCte + " AS " + c, {nodeJoin(*walk(a), c, "k", node)}));
+				}
+			}
+			if (nodes.empty()) {
+				// No arm can start from a seed value: no pairs.
+				std::string none = "SELECT ";
+				for (std::size_t i = 0; i < nSeed; ++i) {
+					none += "NULL AS " + sCol(i) + ", ";
+				}
+				nodes.push_back(none + "CAST(NULL AS VARCHAR) AS " + node + " WHERE FALSE");
+			}
+			if (outKeys != nullptr) {
+				*outKeys = nSeed;
+			}
+			// The start end's term comes from the partner; its column here is a
+			// placeholder (the join never reads it).
+			const std::string c = ctx.nextAlias();
+			const ColumnInfo &fromInfo = tc.schema()[0];
+			const ColumnInfo &toInfo = tc.schema()[1];
+			const ColumnInfo &startInfo = seed->onFrom ? fromInfo : toInfo;
+			const ColumnInfo &nodeInfo = seed->onFrom ? toInfo : fromInfo;
+			std::string sql = "SELECT CAST(NULL AS VARCHAR) AS " + mangleVar(startInfo.var, dialect) +
+			                  closureTagProjection(startInfo, ctx) + ", " + c + "." + node + " AS " +
+			                  mangleVar(nodeInfo.var, dialect) + closureTagProjection(nodeInfo, ctx);
+			for (std::size_t i = 0; i < nSeed; ++i) {
+				sql += ", " + c + "." + sCol(i) + " AS " + skCol(i);
+			}
+			return sql + " FROM (" + unionOf(nodes) + ") AS " + c;
+		}
+	}
+	if (!bothVars) {
+		// A seeded closure carries its start node through every hop.
+		const std::string startCol = dialect.quoteIdentifier("cte_start");
+		std::string seedSrc;
+		if (seed != nullptr) {
+			seedSrc = "(SELECT DISTINCT " + seed->iriCol;
+			for (const auto &k : seed->keyCols) {
+				seedSrc += ", " + k;
+			}
+			seedSrc += " FROM " + seed->cte + ")";
+		}
+		// The first hop of arm `a`: its extra FROM item, its condition and the
+		// start column, from the anchor (raw columns) or from the seed set.
+		struct FirstHop {
+			std::string from;
+			std::string cond;
+			std::string startExpr;
+		};
+		auto firstHop = [&](const ClosureArm &a) {
+			FirstHop h;
+			if (seed == nullptr) {
+				h.cond = anchorCondition(*walk(a), tc.anchorLiteral, dialect);
+				return h;
+			}
+			const std::string sd = ctx.nextAlias();
+			h.from = seedSrc + " AS " + sd;
+			h.startExpr = sd + "." + seed->iriCol + " AS " + startCol;
+			std::vector<NativeKeyPair> pairs = seed->col != nullptr && !seed->keyCols.empty()
+			                                       ? nativeKeyPairs(*walk(a), *seed->col, catalog)
+			                                       : std::vector<NativeKeyPair>();
+			if (!pairs.empty() && pairs.size() == seed->keyCols.size()) {
+				for (std::size_t i = 0; i < pairs.size(); ++i) {
+					h.cond += (i > 0 ? " AND " : "") + pairs[i].leftRef + " = " + sd + "." + seed->keyCols[i];
+				}
+			} else {
+				h.cond = walk(a)->renderedExpr + " = " + sd + "." + seed->iriCol;
+			}
+			return h;
+		};
+		auto withStart = [&](const FirstHop &h, std::vector<std::string> cols) {
+			if (!h.startExpr.empty()) {
+				cols.insert(cols.begin(), h.startExpr);
+			}
+			return cols;
+		};
+		const std::string startCarry = seed != nullptr ? "%A%." + startCol + ", " : "";
+		auto carryStart = [&](const std::string &alias) {
+			std::string out = startCarry;
+			std::size_t pos = out.find("%A%");
+			if (pos != std::string::npos) {
+				out.replace(pos, 3, alias);
+			}
+			return out;
+		};
+
+		// Seeds: one hop from the anchor over core and start arms, on raw columns.
+		std::vector<std::string> seeds;
+		for (const auto *group : {&core, &start}) {
+			for (const auto &a : *group) {
+				if (!seedCanMeet(a)) {
+					continue;
+				}
+				std::vector<std::string> cols = {land(a)->renderedExpr + " AS " + node};
+				for (auto &k : keyCols(*land(a), "k")) {
+					cols.push_back(k);
+				}
+				FirstHop h = firstHop(a);
+				seeds.push_back(armSelect(*a.arm, withStart(h, cols), h.from, {h.cond}));
+			}
+		}
+		std::vector<std::string> nodes;
+		std::string closureCte;
+		if (!seeds.empty()) {
+			closureCte = ctx.nextCteName();
+			std::string r = ctx.nextAlias();
+			std::string s = ctx.nextAlias();
+			std::string recursive;
+			if (!core.empty()) {
+				recursive = " UNION SELECT " + carryStart(r) + s + "." + landCol + carried(s, landKey, false) +
+				            " FROM " + closureCte + " AS " + r + " JOIN " + coreCte + " AS " + s + " ON " +
+				            coreHop(r, s);
+			}
+			ctx.addCte(closureCte, "SELECT * FROM (" + unionOf(seeds) + ")" + recursive);
+		}
+
+		// Output restriction (see the function comment): which parts can meet
+		// the partner, and whether they all carry its raw key columns.
+		auto canMeet = [&](const ColumnInfo *c) {
+			return outCol == nullptr || outCol->templateString.empty() ||
+			       templatesCanEverMatch(c->templateString, outCol->templateString);
+		};
+		bool closureNodesOut = closureCte.empty() ? false : outCol == nullptr;
+		for (const auto *group : {&core, &start}) {
+			for (const auto &a : *group) {
+				closureNodesOut = closureNodesOut || (!closureCte.empty() && canMeet(land(a)));
+			}
+		}
+		std::size_t nOut = 0;
+		if (outCol != nullptr && outKeys != nullptr && seed == nullptr && outCol->prov == Provenance::TemplateExpr &&
+		    !outCol->templateColumnRefs.empty()) {
+			nOut = outCol->templateColumnRefs.size();
+			if (closureNodesOut && (nKeys == 0 || nativeKeyPairs(*ref, *outCol, catalog).size() != nOut)) {
+				nOut = 0;
+			}
+			for (const auto &a : leaf) {
+				if (canMeet(land(a)) && nativeKeyPairs(*land(a), *outCol, catalog).size() != nOut) {
+					nOut = 0;
+				}
+			}
+		}
+		auto outKeyName = [&](std::size_t i) {
+			return dialect.quoteIdentifier("ok_" + std::to_string(i));
+		};
+		if (closureNodesOut) {
+			std::string cols = carryStart(closureCte) + node;
+			for (std::size_t i = 0; i < nOut; ++i) {
+				cols += ", " + closureCte + "." + keyName("k", i) + " AS " + outKeyName(i);
+			}
+			nodes.push_back("SELECT " + cols + " FROM " + closureCte);
+		}
+		// Leaf arms: from the anchor directly, and from every node reached.
+		for (const auto &a : leaf) {
+			if (!canMeet(land(a))) {
+				continue;
+			}
+			std::vector<std::string> cols = {land(a)->renderedExpr + " AS " + node};
+			if (nOut > 0) {
+				std::vector<NativeKeyPair> pairs = nativeKeyPairs(*land(a), *outCol, catalog);
+				for (std::size_t i = 0; i < nOut; ++i) {
+					cols.push_back(pairs[i].leftRef + " AS " + outKeyName(i));
+				}
+			}
+			if (seedCanMeet(a)) {
+				FirstHop h = firstHop(a);
+				nodes.push_back(armSelect(*a.arm, withStart(h, cols), h.from, {h.cond}));
+			}
+			if (!closureCte.empty() && seed == nullptr) {
+				// A semi-join: the closure is the small side, and IN makes it the
+				// hash side whatever the engine estimates for a recursive CTE.
+				std::vector<NativeKeyPair> pairs =
+				    nKeys > 0 ? nativeKeyPairs(*walk(a), *ref, catalog) : std::vector<NativeKeyPair>();
+				std::string lhs;
+				std::string rhs;
+				if (nKeys > 0 && pairs.size() == nKeys) {
+					for (std::size_t i = 0; i < nKeys; ++i) {
+						lhs += (i > 0 ? ", " : "") + pairs[i].leftRef;
+						rhs += (i > 0 ? ", " : "") + keyName("k", i);
+					}
+				} else {
+					lhs = walk(a)->renderedExpr;
+					rhs = node;
+				}
+				if (nKeys > 1 && pairs.size() == nKeys) {
+					lhs = "(" + lhs + ")";
+				}
+				nodes.push_back(
+				    armSelect(*a.arm, cols, "", {lhs + " IN (SELECT " + rhs + " FROM " + closureCte + ")"}));
+			} else if (!closureCte.empty()) {
+				std::string c = ctx.nextAlias();
+				std::vector<std::string> leafCols = cols;
+				leafCols.insert(leafCols.begin(), c + "." + startCol);
+				nodes.push_back(
+				    armSelect(*a.arm, leafCols, closureCte + " AS " + c, {nodeJoin(*walk(a), c, "k", node)}));
+			}
+		}
+		if (nodes.empty()) {
+			// Nothing the partner can meet (or no arm starts from a seed value): an
+			// empty relation of the right shape.
+			nodes.push_back("SELECT " +
+			                std::string(seed != nullptr ? "CAST(NULL AS VARCHAR) AS " + startCol + ", " : "") +
+			                "CAST(NULL AS VARCHAR) AS " + node + " WHERE FALSE");
+			nOut = 0;
+		}
+		if (outKeys != nullptr) {
+			*outKeys = nOut;
+		}
+		const std::string all = unionOf(nodes);
+		if (seed != nullptr) {
+			std::string c = ctx.nextAlias();
+			const ColumnInfo &fromInfo = tc.schema()[0];
+			const ColumnInfo &toInfo = tc.schema()[1];
+			const std::string fromExpr = c + "." + (seed->onFrom ? startCol : node);
+			const std::string toExpr = c + "." + (seed->onFrom ? node : startCol);
+			return "SELECT " + fromExpr + " AS " + mangleVar(fromInfo.var, dialect) +
+			       closureTagProjection(fromInfo, ctx) + ", " + toExpr + " AS " + mangleVar(toInfo.var, dialect) +
+			       closureTagProjection(toInfo, ctx) + " FROM (" + all + ") AS " + c;
+		}
+		if (tc.mode == TransitiveClosureNode::Mode::BothBound) {
+			return "SELECT 1 AS " + dialect.quoteIdentifier("_dummy") + " WHERE " +
+			       dialect.existsClause(false, "SELECT 1 FROM (" + all + ") AS " + ctx.nextAlias() + " WHERE " + node +
+			                                       " = " + tc.targetLiteral);
+		}
+		std::string c = ctx.nextAlias();
+		std::string outKeyCols;
+		for (std::size_t i = 0; i < nOut; ++i) {
+			outKeyCols += ", " + c + "." + outKeyName(i);
+		}
+		return "SELECT " + c + "." + node + " AS " + mangleVar(tc.schema()[0].var, dialect) +
+		       closureTagProjection(tc.schema()[0], ctx) + outKeyCols + " FROM (" + all + ") AS " + c;
+	}
+
+	// Pairs closure, split on leaf arms (entry arms when walking backward, exit
+	// arms when walking forward): core+ u leaf u (core+ joined to leaf).
+	const std::string cFrom = dialect.quoteIdentifier("cte_from");
+	const std::string cTo = dialect.quoteIdentifier("cte_to");
+	std::vector<std::string> pairs;
+	if (!core.empty()) {
+		// Core pairs closure, carrying both ends' keys when keyed.
+		std::string pairsCte = ctx.nextCteName();
+		std::string s1 = ctx.nextAlias();
+		std::string s2 = ctx.nextAlias();
+		std::string r = ctx.nextAlias();
+		std::string seed = "SELECT " + s1 + "." + sFrom + " AS " + cFrom + ", " + s1 + "." + sTo + " AS " + cTo;
+		std::string rec = "SELECT " + r + "." + cFrom + ", " + s2 + "." + sTo;
+		for (std::size_t i = 0; i < nKeys; ++i) {
+			seed += ", " + s1 + "." + keyName("kf", i) + " AS " + keyName("pf", i) + ", " + s1 + "." +
+			        keyName("kt", i) + " AS " + keyName("pt", i);
+			rec += ", " + r + "." + keyName("pf", i) + ", " + s2 + "." + keyName("kt", i);
+		}
+		std::string hop;
+		for (std::size_t i = 0; i < nKeys; ++i) {
+			hop += (i > 0 ? " AND " : "") + r + "." + keyName("pt", i) + " = " + s2 + "." + keyName("kf", i);
+		}
+		if (nKeys == 0) {
+			hop = r + "." + cTo + " = " + s2 + "." + sFrom;
+		}
+		ctx.addCte(pairsCte, seed + " FROM " + coreCte + " AS " + s1 + " UNION " + rec + " FROM " + pairsCte + " AS " +
+		                         r + " JOIN " + coreCte + " AS " + s2 + " ON " + hop);
+		pairs.push_back("SELECT " + cFrom + ", " + cTo + " FROM " + pairsCte);
+		// Leaf arm then core path (entry arms, backward) or core path then leaf
+		// arm (exit arms, forward).
+		for (const auto &a : leaf) {
+			std::string c = ctx.nextAlias();
+			if (!forward) {
+				pairs.push_back(armSelect(*a.arm, {a.from->renderedExpr + " AS " + cFrom, c + "." + cTo},
+				                          pairsCte + " AS " + c, {nodeJoin(*a.to, c, "pf", cFrom)}));
+			} else {
+				pairs.push_back(armSelect(*a.arm, {c + "." + cFrom, a.to->renderedExpr + " AS " + cTo},
+				                          pairsCte + " AS " + c, {nodeJoin(*a.from, c, "pt", cTo)}));
+			}
+		}
+	}
+	for (const auto &a : leaf) {
+		pairs.push_back(
+		    armSelect(*a.arm, {a.from->renderedExpr + " AS " + cFrom, a.to->renderedExpr + " AS " + cTo}, "", {}));
+	}
+	std::string c = ctx.nextAlias();
+	return "SELECT " + c + "." + cFrom + " AS " + mangleVar(tc.schema()[0].var, dialect) +
+	       closureTagProjection(tc.schema()[0], ctx) + ", " + c + "." + cTo + " AS " +
+	       mangleVar(tc.schema()[1].var, dialect) + closureTagProjection(tc.schema()[1], ctx) + " FROM (" +
+	       unionOf(pairs) + ") AS " + c;
+}
+
 // E+ closure rendering. Registers two CTEs on `ctx` (the one-hop step
 // relation, then the recursive closure over it - never inlining step's SQL
 // twice, since both the seed and the recursive term reference it) and
@@ -750,6 +1722,12 @@ std::string renderBind(const BindNode &b, TranslationContext &ctx) {
 // data, which real graphs frequently have.
 std::string renderTransitiveClosure(const TransitiveClosureNode &tc, TranslationContext &ctx,
                                     const ExtraProjections *extra) {
+	if (extra == nullptr) {
+		std::string split = renderSplitClosure(tc, ctx, nullptr);
+		if (!split.empty()) {
+			return split;
+		}
+	}
 	const SqlDialect &dialect = ctx.dialect();
 	std::string fromCol = mangleVar(tc.fromVar, dialect);
 	std::string toCol = mangleVar(tc.toVar, dialect);

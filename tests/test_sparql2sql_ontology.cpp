@@ -200,6 +200,23 @@ TEST_CASE("saturateMapping: derives maps for inverses, domains and ranges", "[sp
 	CHECK(page.find("\"EMP\"") != std::string::npos);
 }
 
+TEST_CASE("saturateMapping: no domain view for a class the subject map already has", "[sparql2sql]") {
+	R2RMLParser parser;
+	R2RMLMapping mapping = parser.parse(SOURCE_R2RML_DIR "sparql2sql_owl.ttl");
+	REQUIRE(mapping.isValid());
+	// The employees map declares ex:Worker itself, so worksIn's domain adds nothing.
+	for (auto &tm : mapping.triplesMaps) {
+		if (tm && tm->id.find("Employees") != std::string::npos) {
+			tm->subjectMap->classIRIs.push_back(kEx + "Worker");
+		}
+	}
+	auto result = saturateMapping(mapping, owlOntology());
+	CHECK(result.triplesMapsAdded == 8); // one fewer than without the class
+	const std::string worker = translate(mapping, "SELECT ?x WHERE { ?x a ex:Worker }");
+	CHECK(worker.find("\"DEPTNO\" IS NOT NULL") == std::string::npos);
+	CHECK(worker.find("\"EMP\"") != std::string::npos);
+}
+
 TEST_CASE("applyTransitiveProperties: rewrites transitive steps to P+", "[sparql2sql]") {
 	CHECK(transitiveRewrites("SELECT * WHERE { ?a ex:next ?b }") == 1);
 	CHECK(transitiveRewrites("SELECT * WHERE { ?a ex:name ?b }") == 0);

@@ -15,6 +15,7 @@
 #include <catch2/catch.hpp>
 
 #include <algorithm>
+#include <iterator>
 #include <cctype>
 #include <map>
 #include <set>
@@ -2825,4 +2826,158 @@ TEST_CASE("SUM of xsd:decimal values is an xsd:decimal") {
 	auto rows = collectRows(*conn->execute(sql));
 	REQUIRE(rows.size() == 1);
 	CHECK(rows[0].at("D_S") == "Dhttp://www.w3.org/2001/XMLSchema#decimal");
+}
+
+namespace {
+
+// Addresses in a region tree with a cycle, for closures over a step that mixes
+// templates (sparql2sql_regions.ttl).
+std::unique_ptr<DuckDBConnection> makeRegionDatabase() {
+	std::unique_ptr<DuckDBConnection> conn(new DuckDBConnection(":memory:"));
+	conn->execute("CREATE TABLE REGION (CODE VARCHAR, PARENT VARCHAR)");
+	conn->execute("INSERT INTO REGION VALUES ('BU1', 'WK1'), ('BU2', 'WK1'), ('BU3', 'WK2'), ('WK1', 'GM1'), "
+	              "('WK2', 'GM1'), ('GM1', NULL), ('GM2', NULL), ('C1', 'C2'), ('C2', 'C1')");
+	conn->execute("CREATE TABLE ADDR (ID INTEGER, REGION VARCHAR)");
+	conn->execute("INSERT INTO ADDR VALUES (1, 'BU1'), (2, 'BU1'), (3, 'BU3'), (4, 'C1'), (5, 'GM2'), (6, NULL)");
+	return conn;
+}
+
+// Every (s, o) pair of ex:liesIn+, computed by hand from the base tables.
+const char *const kRegionPairs =
+    "WITH RECURSIVE e(s, o) AS (SELECT 'http://data.example.com/addr/' || ID, 'http://data.example.com/region/' || "
+    "REGION FROM ADDR WHERE REGION IS NOT NULL UNION ALL SELECT 'http://data.example.com/region/' || CODE, "
+    "'http://data.example.com/region/' || PARENT FROM REGION WHERE PARENT IS NOT NULL), "
+    "c(s, o) AS (SELECT s, o FROM e UNION SELECT c.s, e.o FROM c JOIN e ON c.o = e.s) ";
+
+std::vector<std::vector<std::string>> rowValues(const std::vector<Row> &rows, const std::vector<std::string> &cols) {
+	std::vector<std::vector<std::string>> out;
+	for (const auto &r : rows) {
+		std::vector<std::string> v;
+		for (const auto &c : cols) {
+			v.push_back(r.count(c) != 0 ? r.at(c) : std::string("<missing>"));
+		}
+		out.push_back(v);
+	}
+	std::sort(out.begin(), out.end());
+	return out;
+}
+
+} // namespace
+
+TEST_CASE("closure over mixed templates: every shape answers as a hand-written recursive query") {
+	auto conn = makeRegionDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_regions.ttl");
+	REQUIRE(mapping.isValid());
+	sparql2sql::TypeCatalog cat;
+	sql2rdf::loadTypeCatalog(*conn, &mapping, cat);
+
+	const std::string prefix = "PREFIX ex: <http://example.com/ns#>\nPREFIX a: <http://data.example.com/addr/>\n"
+	                           "PREFIX r: <http://data.example.com/region/>\n";
+	struct Case {
+		const char *sparql;
+		std::vector<std::string> cols;
+		const char *reference; // appended to kRegionPairs
+	};
+	const std::vector<Case> cases = {
+	    {"SELECT ?r WHERE { a:1 ex:liesIn+ ?r }",
+	     {"V_R"},
+	     "SELECT o AS C1 FROM c WHERE s = 'http://data.example.com/addr/1'"},
+	    {"SELECT ?r WHERE { a:4 ex:liesIn+ ?r }",
+	     {"V_R"},
+	     "SELECT o AS C1 FROM c WHERE s = 'http://data.example.com/addr/4'"},
+	    {"SELECT ?x WHERE { ?x ex:liesIn+ r:GM1 }",
+	     {"V_X"},
+	     "SELECT s AS C1 FROM c WHERE o = 'http://data.example.com/region/GM1'"},
+	    {"SELECT ?x WHERE { ?x ex:liesIn+ r:C2 }",
+	     {"V_X"},
+	     "SELECT s AS C1 FROM c WHERE o = 'http://data.example.com/region/C2'"},
+	    {"SELECT ?x ?y WHERE { ?x ex:liesIn+ ?y }", {"V_X", "V_Y"}, "SELECT s AS C1, o AS C2 FROM c"},
+	    {"SELECT ?x WHERE { ?x ex:liesIn* r:WK1 }",
+	     {"V_X"},
+	     "SELECT s AS C1 FROM c WHERE o = 'http://data.example.com/region/WK1' UNION SELECT "
+	     "'http://data.example.com/region/WK1'"},
+	    // A unary closure joined to a scan on the reached node: only the arms the
+	    // scan can meet, joined on keys; and the same over a union of scans.
+	    {"SELECT ?x WHERE { ?x a ex:Region ; ex:liesIn+ r:GM1 }",
+	     {"V_X"},
+	     "SELECT s AS C1 FROM c WHERE o = 'http://data.example.com/region/GM1' AND s LIKE "
+	     "'http://data.example.com/region/%'"},
+	    {"SELECT ?x WHERE { ?x a ex:Address ; ex:liesIn+ r:GM1 }",
+	     {"V_X"},
+	     "SELECT s AS C1 FROM c WHERE o = 'http://data.example.com/region/GM1' AND s LIKE "
+	     "'http://data.example.com/addr/%'"},
+	    {"SELECT ?r WHERE { ?r a ex:Region . a:1 ex:liesIn+ ?r }",
+	     {"V_R"},
+	     "SELECT o AS C1 FROM c WHERE s = 'http://data.example.com/addr/1'"},
+	    {"SELECT ?x WHERE { { ?x a ex:Address } UNION { ?x a ex:Region } ?x ex:liesIn+ r:GM1 }",
+	     {"V_X"},
+	     "SELECT s AS C1 FROM c WHERE o = 'http://data.example.com/region/GM1'"},
+	    // Seeded from a partner on the subject end, then on the object end.
+	    {"SELECT ?a ?r WHERE { ?a a ex:Address ; ex:liesIn+ ?r }",
+	     {"V_A", "V_R"},
+	     "SELECT s AS C1, o AS C2 FROM c WHERE s LIKE 'http://data.example.com/addr/%'"},
+	    {"SELECT ?x ?g WHERE { ?x ex:liesIn+ ?g . ?g a ex:Top }",
+	     {"V_X", "V_G"},
+	     "SELECT s AS C1, o AS C2 FROM c WHERE o IN ('http://data.example.com/region/GM1', "
+	     "'http://data.example.com/region/GM2')"},
+	    // A seed no arm can start from (regions never lie in an address).
+	    {"SELECT ?a ?x WHERE { ?a a ex:Address . ?x ex:liesIn+ ?a }",
+	     {"V_A", "V_X"},
+	     "SELECT s AS C1, o AS C2 FROM c WHERE FALSE"},
+	    {"SELECT (COUNT(*) AS ?n) WHERE { ?a a ex:Address ; ex:liesIn+ ?g . ?g a ex:Top }",
+	     {"V_N"},
+	     "SELECT CAST(count(*) AS VARCHAR) AS C1 FROM c WHERE s LIKE 'http://data.example.com/addr/%' AND o IN "
+	     "('http://data.example.com/region/GM1', 'http://data.example.com/region/GM2')"},
+	};
+	for (const auto &cs : cases) {
+		for (const sparql2sql::TypeCatalog *catalog : {static_cast<const sparql2sql::TypeCatalog *>(&cat),
+		                                               static_cast<const sparql2sql::TypeCatalog *>(nullptr)}) {
+			INFO("query: " << cs.sparql << (catalog != nullptr ? " (catalog)" : " (no catalog)"));
+			auto got = rowValues(runWithCatalog(*conn, prefix + cs.sparql, mapping, catalog), cs.cols);
+			// Reference columns are C1, C2, ... in the SPARQL query's column order.
+			std::vector<std::string> refCols;
+			for (std::size_t i = 1; i <= cs.cols.size(); ++i) {
+				refCols.push_back("C" + std::to_string(i));
+			}
+			auto want = rowValues(collectRows(*conn->execute(std::string(kRegionPairs) + cs.reference)), refCols);
+			std::vector<std::vector<std::string>> onlyGot;
+			std::vector<std::vector<std::string>> onlyWant;
+			std::set_difference(got.begin(), got.end(), want.begin(), want.end(), std::back_inserter(onlyGot));
+			std::set_difference(want.begin(), want.end(), got.begin(), got.end(), std::back_inserter(onlyWant));
+			INFO("only translated: " << onlyGot.size() << (onlyGot.empty() ? "" : " e.g. " + onlyGot[0].back()));
+			INFO("only reference: " << onlyWant.size() << (onlyWant.empty() ? "" : " e.g. " + onlyWant[0].front()));
+			CHECK(got == want);
+		}
+	}
+	CHECK(runWithCatalog(*conn, prefix + "ASK { a:3 ex:liesIn+ r:GM1 }", mapping, &cat).at(0).at("ASK") == "true");
+	CHECK(runWithCatalog(*conn, prefix + "ASK { a:3 ex:liesIn+ r:WK1 }", mapping, &cat).at(0).at("ASK") == "false");
+}
+
+TEST_CASE("closure over mixed templates: only region links recurse, addresses join once") {
+	auto conn = makeRegionDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_regions.ttl");
+	sparql2sql::TypeCatalog cat;
+	sql2rdf::loadTypeCatalog(*conn, &mapping, cat);
+	const std::string sql = translateBom("PREFIX ex: <http://example.com/ns#>\n"
+	                                     "SELECT ?x WHERE { ?x ex:liesIn+ <http://data.example.com/region/GM1> }",
+	                                     mapping, &cat);
+	INFO("SQL: " << sql);
+	// The recursive step reads REGION only; ADDR is joined outside it, on its
+	// raw REGION column.
+	const std::size_t rec = sql.find("WITH RECURSIVE");
+	REQUIRE(rec != std::string::npos);
+	CHECK(sql.find("\"k0\"") != std::string::npos);
+	CHECK(sql.find("CAST(t") != std::string::npos);
+	CHECK(sql.find("= 'GM1'") != std::string::npos); // the anchor, inverted to the raw code
+
+	// Both ends variable, joined to the addresses: the closure is seeded from
+	// them and carries their raw keys (s0), not their IRIs, and meets them on sk_0.
+	const std::string seeded = translateBom("PREFIX ex: <http://example.com/ns#>\n"
+	                                        "SELECT ?a ?r WHERE { ?a a ex:Address ; ex:liesIn+ ?r }",
+	                                        mapping, &cat);
+	INFO("seeded SQL: " << seeded);
+	CHECK(seeded.find("\"s0\"") != std::string::npos);
+	CHECK(seeded.find("\"sk_0\" = ") != std::string::npos);
 }

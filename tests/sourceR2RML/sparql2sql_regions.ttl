@@ -1,0 +1,29 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#>.
+@prefix ex: <http://example.com/ns#>.
+
+# Addresses in a region hierarchy, under one ex:liesIn: address -> region and
+# region -> parent region. The two kinds of link have different subject
+# templates, and an address IRI is never the object of a link, so an address
+# link can only be the first hop of a path. That is the shape the split closure
+# renders (core arms recurse, leaf arms join once). REGION holds a two-node
+# cycle (C1 -> C2 -> C1) so the recursion must still terminate.
+
+<#Address>
+    rr:logicalTable [ rr:tableName "ADDR" ];
+    rr:subjectMap [ rr:template "http://data.example.com/addr/{ID}"; rr:class ex:Address ];
+    rr:predicateObjectMap [
+        rr:predicate ex:liesIn;
+        rr:objectMap [ rr:template "http://data.example.com/region/{REGION}" ];
+    ].
+
+<#Region>
+    rr:logicalTable [ rr:tableName "REGION" ];
+    rr:subjectMap [ rr:template "http://data.example.com/region/{CODE}"; rr:class ex:Region ];
+    rr:predicateObjectMap [
+        rr:predicate ex:liesIn;
+        rr:objectMap [ rr:template "http://data.example.com/region/{PARENT}" ];
+    ].
+
+<#Top>
+    rr:logicalTable [ rr:sqlQuery "SELECT CODE FROM REGION WHERE CODE LIKE 'GM%'" ];
+    rr:subjectMap [ rr:template "http://data.example.com/region/{CODE}"; rr:class ex:Top ].
