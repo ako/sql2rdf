@@ -15,10 +15,12 @@
 #include <catch2/catch.hpp>
 
 #include <algorithm>
-#include <iterator>
 #include <cctype>
+#include <cmath>
+#include <iterator>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -2345,8 +2347,28 @@ AggRun runAggregate(DuckDBConnection &conn, const std::string &body, bool withCa
 	return run;
 }
 
+// Whether two xsd:double result texts are the same number up to rounding.
+bool sameDouble(const std::string &a, const std::string &b) {
+	if (a == b) {
+		return true;
+	}
+	try {
+		const double x = std::stod(a);
+		const double y = std::stod(b);
+		return std::fabs(x - y) <= 1e-12 * std::max(1.0, std::max(std::fabs(x), std::fabs(y)));
+	} catch (const std::exception &) {
+		return false;
+	}
+}
+
 // Native and text paths return the same rows; returns the native run.
-AggRun bothPaths(DuckDBConnection &conn, const std::string &body) {
+//
+// `doubleCols` names result columns holding a floating-point aggregate
+// (xsd:double SUM/AVG): those are compared as numbers up to rounding, because
+// the engine aggregates in parallel and adds the rows in a different order on
+// each run - 0.1 + 0.2 + 0.7 is 1.0 in one order and 0.9999999999999999 in
+// another. Every other column, exact types included, must match as text.
+AggRun bothPaths(DuckDBConnection &conn, const std::string &body, const std::set<std::string> &doubleCols = {}) {
 	AggRun native = runAggregate(conn, body, true);
 	AggRun text = runAggregate(conn, body, false);
 	INFO("native SQL: " << native.sql);
@@ -2356,7 +2378,22 @@ AggRun bothPaths(DuckDBConnection &conn, const std::string &body) {
 	auto b = text.rows;
 	std::sort(a.begin(), a.end());
 	std::sort(b.begin(), b.end());
-	CHECK(a == b);
+	if (doubleCols.empty()) {
+		CHECK(a == b);
+		return native;
+	}
+	REQUIRE(a.size() == b.size());
+	for (std::size_t i = 0; i < a.size(); ++i) {
+		REQUIRE(a[i].size() == b[i].size());
+		for (const auto &cell : a[i]) {
+			INFO("column " << cell.first << ": " << cell.second << " vs " << b[i].at(cell.first));
+			if (doubleCols.count(cell.first) != 0) {
+				CHECK(sameDouble(cell.second, b[i].at(cell.first)));
+			} else {
+				CHECK(cell.second == b[i].at(cell.first));
+			}
+		}
+	}
 	return native;
 }
 
@@ -2388,8 +2425,10 @@ TEST_CASE("native aggregates: decimals stay exact, a DOUBLE column declared deci
 	CHECK(rate.rows[0].at("V_S") == "1");
 	CHECK(rate.sql.find("SUM(TRY_CAST(t") != std::string::npos);
 	// The same column declared xsd:double does go native.
-	auto dbl = bothPaths(*conn, "SELECT (SUM(?r) AS ?s) WHERE { ?m ex:ratedbl ?r }");
+	auto dbl = bothPaths(*conn, "SELECT (SUM(?r) AS ?s) WHERE { ?m ex:ratedbl ?r }", {"V_S"});
 	CHECK(dbl.sql.find(".\"n_r\"") != std::string::npos);
+	REQUIRE(dbl.rows.size() == 1);
+	CHECK(sameDouble(dbl.rows[0].at("V_S"), "1")); // 0.1 + 0.2 + 0.7, in whatever order
 }
 
 TEST_CASE("native aggregates: COUNT(DISTINCT) over a text column and over a one-placeholder IRI") {
