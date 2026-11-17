@@ -363,7 +363,7 @@ std::string prependCtes(const TranslationContext &ctx, const std::string &body) 
 		if (referencing.find(cte.name) == std::string::npos) {
 			continue;
 		}
-		cteDefs.push_back(cte.name + " AS (" + cte.bodySql + ")");
+		cteDefs.push_back(cte.name + (cte.materialized ? " AS MATERIALIZED (" : " AS (") + cte.bodySql + ")");
 		referencing += cte.bodySql;
 	}
 	if (cteDefs.empty()) {

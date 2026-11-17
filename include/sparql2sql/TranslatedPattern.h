@@ -36,6 +36,9 @@ typedef std::map<std::string, const sparql::ast::Term *> ConstantBindings;
 struct CteDef {
 	std::string name;
 	std::string bodySql;
+	/// Emitted AS MATERIALIZED: computed once even where it is read twice (a
+	/// seeded closure reads its partner as the seed and again in the join).
+	bool materialized = false;
 };
 
 /// The intermediate representation threaded through translation: a SQL
@@ -421,8 +424,8 @@ public:
 	///
 	/// Property-path closure rendering is the only caller; hoisted rr:sqlQuery
 	/// views go through viewCteName() into a separate list instead (see there).
-	void addCte(const std::string &name, const std::string &bodySql) {
-		pendingCtes_.push_back(CteDef {name, bodySql});
+	void addCte(const std::string &name, const std::string &bodySql, bool materialized = false) {
+		pendingCtes_.push_back(CteDef {name, bodySql, materialized});
 	}
 
 	const std::vector<CteDef> &pendingCtes() const {
@@ -445,7 +448,7 @@ public:
 			return it->second;
 		}
 		std::string name = nextCteName();
-		viewCtes_.push_back(CteDef {name, bodySql});
+		viewCtes_.push_back(CteDef {name, bodySql, false});
 		return viewCteNames_.insert(std::make_pair(identity, name)).first->second;
 	}
 
