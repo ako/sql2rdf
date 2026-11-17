@@ -1067,7 +1067,10 @@ one exception, handled by rewriting the query.
 - `rdfs:domain D` gives the subject class D. When the object is produced whenever the subject is
   (a constant, or a template or column using only the subject's columns), D goes on the subject
   map itself. Otherwise a new map types the subject over only the rows where the object (and any
-  graph) is not NULL, or, for a referencing object map, where the join finds a parent row.
+  graph) is not NULL, or, for a referencing object map, where the join finds a parent row. A
+  domain class the triples map's subject map already declares is skipped (when the
+  predicate-object map has no graph map of its own): it would only add a filtered view that a
+  query for the class unions with the whole table.
 - `rdfs:range R` gives an IRI or blank node object class R, through a new map whose subject is
   the object, over the rows that produce the triple. Literal objects get no class.
 - The filtered maps are `rr:sqlQuery` views over the original logical table
@@ -1151,6 +1154,21 @@ one exception, handled by rewriting the query.
     before closures and other derived-table operands (each one connected to what is already joined
     where possible), so that scans of one table can merge into one block and lose their self-join
     even when a closure is written between them.
+    When `E`'s arms have different templates (a transitive property linking two kinds of thing,
+    such as addresses to their neighbourhood and regions to their parent region), each arm is
+    classified from its templates (`templatesCanEverMatch`): a *leaf* arm lands where no arm
+    walks, so it can only be the last hop; a *start* arm walks where no arm lands, so only the
+    first; the rest are *core* arms. Only core arms recurse (on raw keys when they share one
+    template shape); start arms join once at the first hop and leaf arms once after the recursion,
+    as a semi-join on keys. A constant anchor is compared on the raw columns its IRI inverts to.
+    A two-variable closure (`?x :p+ ?y`) joined to a scan that binds one end is seeded from that
+    scan (the scan becomes a CTE, the recursion walks only from its distinct values, carrying the
+    start's raw keys rather than its IRI when it can, and the join meets on those keys). A
+    one-end-anchored closure joined to a scan on the node it reaches keeps only the arms the
+    scan's template can meet and joins on raw keys; joined to a union of scans, the join is made
+    per arm (sharing one rendering of the closure), so each arm is narrowed before the union
+    removes duplicates. A pairs closure that is joined to nothing seedable still enumerates every
+    pair.
 - **Named graphs / `GRAPH`**: supported. `rr:graph`/`rr:graphMap` on a subject map or a
   predicate-object map are read *in reverse*, exactly as the term maps for subject/predicate/object
   are: the graph becomes a fourth term position, so `GRAPH <iri>` prunes candidates whose graph map
