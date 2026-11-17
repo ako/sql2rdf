@@ -2921,6 +2921,21 @@ TEST_CASE("closure over mixed templates: every shape answers as a hand-written r
 	     {"V_X", "V_G"},
 	     "SELECT s AS C1, o AS C2 FROM c WHERE o IN ('http://data.example.com/region/GM1', "
 	     "'http://data.example.com/region/GM2')"},
+	    // Keys through joins: the closure hands the reached node's keys up, and
+	    // drops output parts the next join's template can never meet.
+	    {"SELECT ?g (COUNT(?a) AS ?n) WHERE { ?a a ex:Address ; ex:liesIn+ ?g . ?g a ex:Top } GROUP BY ?g",
+	     {"V_G", "V_N"},
+	     "SELECT o AS C1, CAST(count(*) AS VARCHAR) AS C2 FROM c WHERE s LIKE 'http://data.example.com/addr/%' "
+	     "AND o IN ('http://data.example.com/region/GM1', 'http://data.example.com/region/GM2') GROUP BY o"},
+	    {"SELECT ?g (COUNT(?a) AS ?n) WHERE { VALUES ?g { r:GM1 r:GM2 r:C1 } ?a ex:liesIn+ ?g . ?a a ex:Address } "
+	     "GROUP BY ?g",
+	     {"V_G", "V_N"},
+	     "SELECT o AS C1, CAST(count(*) AS VARCHAR) AS C2 FROM c WHERE s LIKE 'http://data.example.com/addr/%' "
+	     "AND o IN ('http://data.example.com/region/GM1', 'http://data.example.com/region/GM2', "
+	     "'http://data.example.com/region/C1') GROUP BY o"},
+	    {"SELECT ?a ?r WHERE { ?a a ex:Address ; ex:liesIn+ ?r . ?r a ex:Region }",
+	     {"V_A", "V_R"},
+	     "SELECT s AS C1, o AS C2 FROM c WHERE s LIKE 'http://data.example.com/addr/%'"},
 	    // A seed no arm can start from (regions never lie in an address).
 	    {"SELECT ?a ?x WHERE { ?a a ex:Address . ?x ex:liesIn+ ?a }",
 	     {"V_A", "V_X"},
@@ -2980,4 +2995,13 @@ TEST_CASE("closure over mixed templates: only region links recurse, addresses jo
 	INFO("seeded SQL: " << seeded);
 	CHECK(seeded.find("\"s0\"") != std::string::npos);
 	CHECK(seeded.find("\"sk_0\" = ") != std::string::npos);
+
+	// Joined on to the top regions: the region keys travel up and that join
+	// compares them, not the region IRIs.
+	const std::string chained = translateBom("PREFIX ex: <http://example.com/ns#>\n"
+	                                         "SELECT ?g (COUNT(?a) AS ?n) WHERE { ?a a ex:Address ; ex:liesIn+ ?g . "
+	                                         "?g a ex:Top } GROUP BY ?g",
+	                                         mapping, &cat);
+	INFO("chained SQL: " << chained);
+	CHECK(chained.find("\"kk0_g\" = ") != std::string::npos);
 }

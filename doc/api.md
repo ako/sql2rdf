@@ -1168,7 +1168,20 @@ one exception, handled by rewriting the query.
     scan's template can meet and joins on raw keys; joined to a union of scans, the join is made
     per arm (sharing one rendering of the closure), so each arm is narrowed before the union
     removes duplicates. A pairs closure that is joined to nothing seedable still enumerates every
-    pair.
+    pair. A seeded closure is factored: the first hop lands each start on a core node, the recursion
+    runs once per distinct landing node (carrying the landing node, not the start), and the starts
+    are joined back, so the recursion stays the size of the core however many starts there are.
+- **Raw keys through joins (late term materialisation).** A variable built from an `rr:template`
+  or `rr:column` can travel beside its term text as hidden raw-key columns (`kk<i>_<var>`). Every
+  join asks its inputs for the keys of its join variables (and of whatever its own parent asked
+  for), compares keys where both inputs provide them in one shape over comparable columns (the
+  native-key conditions; needs a catalog), and passes requested keys up through joins, FILTERs,
+  BINDs, unions whose arms all agree, and seeded closures. A term's text is then only referenced
+  where something reads it, so the engine never builds it for rows a join discards. Each join also
+  hands its inputs the `rr:template` the other input's terms come from (read off the IR), so a
+  union leaves out arms, and a closure leaves out output parts, whose template can never meet it.
+  A deduplicating union only carries keys when every arm provides them in one shape, so keys
+  never split one term into two rows.
 - **Named graphs / `GRAPH`**: supported. `rr:graph`/`rr:graphMap` on a subject map or a
   predicate-object map are read *in reverse*, exactly as the term maps for subject/predicate/object
   are: the graph becomes a fourth term position, so `GRAPH <iri>` prunes candidates whose graph map
