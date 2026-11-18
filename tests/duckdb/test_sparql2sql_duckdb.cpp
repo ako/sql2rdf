@@ -3069,9 +3069,10 @@ TEST_CASE("star over one class of two that share predicates: rows are those of t
 	std::unique_ptr<DuckDBConnection> conn = makeStandingsDatabase();
 	std::vector<Row> rows = translateAndRun(*conn, "standings_driver_star.rq", "sparql2sql_standings.ttl");
 	REQUIRE(rows.size() == 2);
-	CHECK(columnSeq(rows, "V_S") == std::vector<std::string>{"http://ex.org/season/2021", "http://ex.org/season/2022"});
-	CHECK(columnSeq(rows, "V_P") == std::vector<std::string>{"395", "454"});
-	CHECK(columnSeq(rows, "V_POS") == std::vector<std::string>{"1", "1"});
+	CHECK(columnSeq(rows, "V_S") ==
+	      std::vector<std::string> {"http://ex.org/season/2021", "http://ex.org/season/2022"});
+	CHECK(columnSeq(rows, "V_P") == std::vector<std::string> {"395", "454"});
+	CHECK(columnSeq(rows, "V_POS") == std::vector<std::string> {"1", "1"});
 }
 
 TEST_CASE("a shared predicate without a class constraint answers from both classes' tables") {
