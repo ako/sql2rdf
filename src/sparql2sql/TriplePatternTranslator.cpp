@@ -104,7 +104,7 @@ InversionResult resolveInversion(const TermSource &src, const sparql::ast::Term 
 	return invertTermMapAgainstBoundTerm(*src.termMap, boundTerm, src.alias, dialect, catalog, src.tableIdentity);
 }
 
-// A base table is already a bare name, so it is referenced directly. An
+// A base table is referenced directly, by its (possibly schema-qualified) name. An
 // rr:sqlQuery view is instead hoisted into a top-level CTE and referenced by
 // name: this function is reached once per use site, and a single view commonly
 // backs many of them (every predicate-object map of its TriplesMap, and every
@@ -113,7 +113,12 @@ InversionResult resolveInversion(const TermSource &src, const sparql::ast::Term 
 // occurrences were one relation.
 std::string logicalTableFromSql(const r2rml::LogicalTable &lt, const std::string &alias, TranslationContext &ctx) {
 	if (const auto *base = dynamic_cast<const r2rml::BaseTableOrView *>(&lt)) {
-		return ctx.dialect().quoteIdentifier(base->tableName) + " AS " + alias;
+		// rr:tableName is a schema-qualified name (R2RML 5.1): quote each part.
+		std::string name;
+		for (const auto &part : base->nameParts()) {
+			name += (name.empty() ? "" : ".") + ctx.dialect().quoteIdentifier(part);
+		}
+		return name + " AS " + alias;
 	}
 	if (const auto *view = dynamic_cast<const r2rml::R2RMLView *>(&lt)) {
 		return ctx.viewCteName(logicalTableIdentity(lt), stripTrailingSemicolon(view->sqlQuery)) + " AS " + alias;

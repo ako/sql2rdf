@@ -3086,3 +3086,44 @@ TEST_CASE("a shared predicate without a class constraint answers from both class
 	                         {"V_S", "http://ex.org/season/2022"},
 	                         {"V_P", "308"}}));
 }
+
+namespace {
+
+// hr.EMP and sales."Dept.Info" (sparql2sql_schema_table.ttl), next to a main.EMP
+// whose rows must never appear: the mapping names hr.EMP.
+std::unique_ptr<DuckDBConnection> makeSchemaDatabase() {
+	std::unique_ptr<DuckDBConnection> conn(new DuckDBConnection(":memory:"));
+	conn->execute("CREATE SCHEMA hr");
+	conn->execute("CREATE SCHEMA sales");
+	conn->execute("CREATE TABLE hr.EMP (ID INTEGER PRIMARY KEY, NAME VARCHAR NOT NULL)");
+	conn->execute("INSERT INTO hr.EMP VALUES (1, 'Ada'), (2, 'Grace')");
+	conn->execute("CREATE TABLE main.EMP (ID INTEGER, NAME VARCHAR)");
+	conn->execute("INSERT INTO main.EMP VALUES (9, 'not in hr')");
+	conn->execute("CREATE TABLE sales.\"Dept.Info\" (ID INTEGER, NAME VARCHAR)");
+	conn->execute("INSERT INTO sales.\"Dept.Info\" VALUES (10, 'Sales')");
+	return conn;
+}
+
+} // namespace
+
+TEST_CASE("schema-qualified rr:tableName: rows come from the named schema's table") {
+	std::unique_ptr<DuckDBConnection> conn = makeSchemaDatabase();
+	std::vector<Row> rows = translateAndRun(*conn, "schema_table_names.rq", "sparql2sql_schema_table.ttl");
+	REQUIRE(rows.size() == 3);
+	CHECK(columnSeq(rows, "V_N") == std::vector<std::string> {"Sales", "Ada", "Grace"});
+}
+
+TEST_CASE("schema-qualified rr:tableName: the type catalog files the table under that name") {
+	std::unique_ptr<DuckDBConnection> conn = makeSchemaDatabase();
+	R2RMLParser mappingParser;
+	R2RMLMapping mapping = mappingParser.parse(SOURCE_R2RML_DIR "sparql2sql_schema_table.ttl");
+	sparql2sql::TypeCatalog cat;
+	sql2rdf::loadTypeCatalog(*conn, &mapping, cat);
+	CHECK(cat.typeOf("hr.EMP", "ID") == "INTEGER");
+	CHECK(cat.isNotNull("hr.EMP", "NAME"));
+	CHECK(cat.coversUniqueKey("hr.EMP", {"ID"}));
+	CHECK(cat.coversUniqueKey("memory.hr.EMP", {"ID"}));
+	// main.EMP declares no key, and hr.EMP's must not leak onto it.
+	CHECK_FALSE(cat.coversUniqueKey("main.EMP", {"ID"}));
+	CHECK_FALSE(cat.isNotNull("main.EMP", "NAME"));
+}
