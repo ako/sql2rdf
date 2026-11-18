@@ -1,6 +1,8 @@
 #include "sparql2sql/TemplateUtil.h"
 
 #include <algorithm>
+#include <utility>
+#include <vector>
 
 #include "sparql2sql/SqlDialect.h"
 
@@ -251,6 +253,125 @@ bool templatesCanEverMatch(const std::string &templateA, const std::string &temp
 		return false;
 	}
 	return true;
+}
+
+namespace {
+
+// A template as a sequence of positions: a literal character, or a placeholder
+// that matches any run (possibly empty) of characters from its alphabet.
+struct TemplateItem {
+	bool placeholder = false;
+	unsigned char ch = 0;
+};
+
+std::vector<TemplateItem> templateItems(const std::string &tmpl) {
+	std::vector<TemplateItem> items;
+	for (const auto &seg : parseTemplate(tmpl)) {
+		if (seg.isPlaceholder) {
+			TemplateItem item;
+			item.placeholder = true;
+			items.push_back(item);
+			continue;
+		}
+		for (char c : seg.text) {
+			TemplateItem item;
+			item.ch = static_cast<unsigned char>(c);
+			items.push_back(item);
+		}
+	}
+	return items;
+}
+
+// What a percent-encoded (IRI-safe) placeholder value can contain: the RFC 3986
+// unreserved characters, '%' (from the escapes themselves), and - for R2RML
+// 7.3, which leaves ucschar unencoded, unlike DuckDB's url_encode - any
+// non-ASCII byte. A superset of what any conforming dialect emits, so a
+// template pair proven disjoint over it is disjoint for real values too.
+bool inEncodedAlphabet(unsigned char c) {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+	       c == '_' || c == '~' || c == '%' || c >= 0x80;
+}
+
+} // namespace
+
+bool templatesCanEverMatch(const std::string &templateA, const std::string &templateB, bool aPercentEncoded,
+                           bool bPercentEncoded) {
+	if (templateA == templateB) {
+		return true;
+	}
+	// Each template is a small automaton: state i sits before item i, a literal
+	// item moves on its own character, a placeholder loops on any character of
+	// its alphabet and may be left without consuming one. The two can produce a
+	// common string exactly when the product of the two automata reaches both
+	// end states - a decision, not an estimate, for the alphabets above.
+	const std::vector<TemplateItem> a = templateItems(templateA);
+	const std::vector<TemplateItem> b = templateItems(templateB);
+	const std::size_t na = a.size();
+	const std::size_t nb = b.size();
+	auto accepts = [](const TemplateItem &item, bool encoded, unsigned char c) {
+		return item.placeholder ? (!encoded || inEncodedAlphabet(c)) : item.ch == c;
+	};
+
+	// Characters worth trying: every literal character of either template, plus
+	// one stand-in for all the characters that appear in neither - those differ
+	// only in whether an encoded placeholder accepts them, so one from inside
+	// and one from outside the encoded alphabet cover them all.
+	std::vector<bool> inLiterals(256, false);
+	for (const auto *items : {&a, &b}) {
+		for (const auto &item : *items) {
+			if (!item.placeholder) {
+				inLiterals[item.ch] = true;
+			}
+		}
+	}
+	std::vector<unsigned char> alphabet;
+	bool haveEncoded = false;
+	bool haveOther = false;
+	for (int c = 1; c < 256; ++c) {
+		const auto uc = static_cast<unsigned char>(c);
+		if (inLiterals[uc]) {
+			alphabet.push_back(uc);
+		} else if (inEncodedAlphabet(uc) ? !haveEncoded : !haveOther) {
+			(inEncodedAlphabet(uc) ? haveEncoded : haveOther) = true;
+			alphabet.push_back(uc);
+		}
+	}
+
+	std::vector<bool> seen((na + 1) * (nb + 1), false);
+	std::vector<std::pair<std::size_t, std::size_t>> work;
+	auto visit = [&](std::size_t i, std::size_t j) {
+		if (!seen[i * (nb + 1) + j]) {
+			seen[i * (nb + 1) + j] = true;
+			work.emplace_back(i, j);
+		}
+	};
+	visit(0, 0);
+	while (!work.empty()) {
+		const std::size_t i = work.back().first;
+		const std::size_t j = work.back().second;
+		work.pop_back();
+		if (i == na && j == nb) {
+			return true;
+		}
+		// A placeholder may end without consuming anything.
+		if (i < na && a[i].placeholder) {
+			visit(i + 1, j);
+		}
+		if (j < nb && b[j].placeholder) {
+			visit(i, j + 1);
+		}
+		if (i == na || j == nb) {
+			continue; // one side is finished: no character can advance both.
+		}
+		for (unsigned char c : alphabet) {
+			if (accepts(a[i], aPercentEncoded, c) && accepts(b[j], bPercentEncoded, c)) {
+				// A placeholder stays put after consuming (it may consume more); a
+				// literal moves on.
+				visit(a[i].placeholder ? i : i + 1, b[j].placeholder ? j : j + 1);
+			}
+		}
+	}
+	return false;
 }
 
 bool sameTemplateShape(const std::string &templateA, const std::string &templateB) {

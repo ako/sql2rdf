@@ -3044,3 +3044,45 @@ TEST_CASE("closure over mixed templates: only region links recurse, addresses jo
 	INFO("chained SQL: " << chained);
 	CHECK(chained.find("\"kk0_g\" = ") != std::string::npos);
 }
+
+namespace {
+
+// Two standings tables whose IRI subject templates differ only in a middle
+// literal (sparql2sql_standings.ttl), with overlapping (YEAR, POS) keys so a
+// wrong join on the key columns alone, or a missing arm, would change the rows.
+std::unique_ptr<DuckDBConnection> makeStandingsDatabase() {
+	std::unique_ptr<DuckDBConnection> conn(new DuckDBConnection(":memory:"));
+	conn->execute("CREATE TABLE DRIVER_STANDINGS (YEAR INTEGER, POS INTEGER, DRIVER VARCHAR, POINTS INTEGER, "
+	              "POSTEXT VARCHAR)");
+	conn->execute("INSERT INTO DRIVER_STANDINGS VALUES (2021, 1, 'max', 395, '1'), (2021, 2, 'lewis', 387, '2'), "
+	              "(2022, 1, 'max', 454, '1'), (2022, 2, 'charles', 308, '2')");
+	conn->execute("CREATE TABLE CONSTRUCTOR_STANDINGS (YEAR INTEGER, POS INTEGER, TEAM VARCHAR, POINTS INTEGER, "
+	              "POSTEXT VARCHAR)");
+	conn->execute("INSERT INTO CONSTRUCTOR_STANDINGS VALUES (2021, 1, 'mercedes', 613, '1'), "
+	              "(2021, 2, 'redbull', 585, '2'), (2022, 1, 'redbull', 759, '1')");
+	return conn;
+}
+
+} // namespace
+
+TEST_CASE("star over one class of two that share predicates: rows are those of that class only") {
+	std::unique_ptr<DuckDBConnection> conn = makeStandingsDatabase();
+	std::vector<Row> rows = translateAndRun(*conn, "standings_driver_star.rq", "sparql2sql_standings.ttl");
+	REQUIRE(rows.size() == 2);
+	CHECK(columnSeq(rows, "V_S") ==
+	      std::vector<std::string> {"http://ex.org/season/2021", "http://ex.org/season/2022"});
+	CHECK(columnSeq(rows, "V_P") == std::vector<std::string> {"395", "454"});
+	CHECK(columnSeq(rows, "V_POS") == std::vector<std::string> {"1", "1"});
+}
+
+TEST_CASE("a shared predicate without a class constraint answers from both classes' tables") {
+	std::unique_ptr<DuckDBConnection> conn = makeStandingsDatabase();
+	std::vector<Row> rows = translateAndRun(*conn, "standings_points_all.rq", "sparql2sql_standings.ttl");
+	REQUIRE(rows.size() == 7);
+	CHECK(containsRow(rows, {{"V_ST", "http://ex.org/season/2021/constructor-standing/1"},
+	                         {"V_S", "http://ex.org/season/2021"},
+	                         {"V_P", "613"}}));
+	CHECK(containsRow(rows, {{"V_ST", "http://ex.org/season/2022/driver-standing/2"},
+	                         {"V_S", "http://ex.org/season/2022"},
+	                         {"V_P", "308"}}));
+}

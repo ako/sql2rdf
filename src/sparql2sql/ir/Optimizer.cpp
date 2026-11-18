@@ -1166,11 +1166,11 @@ RelNodePtr pushFilters(RelNodePtr node, TranslationContext *ctx) {
 //
 // This runs before pushFilters/flatten, directly on the Join/Union tree
 // PatternFolder builds, using each EquiKey's shared variable to line up the
-// two joined patterns' candidates. It only looks at *directly* visible
-// UnionByName/Spj children of a JoinNode - a variable produced by a nested,
-// still-composite JoinNode (three or more patterns joined in a chain) is left
-// alone rather than chased through, which only forgoes pruning, never risks
-// an incorrect one.
+// two joined patterns' candidates. The side being pruned must be a
+// UnionByName of single-candidate arms; the side it is checked against may be
+// anything - a variable produced by a nested, still-composite JoinNode (three
+// or more patterns joined in a chain, the usual shape of a star query) is
+// chased through it to the scans that produce it (gatherCandidates).
 
 // One directly-visible alternative's template for a variable, or "no
 // template" when the column isn't an rr:template expression (a plain column,
@@ -1180,6 +1180,13 @@ RelNodePtr pushFilters(RelNodePtr node, TranslationContext *ctx) {
 struct TemplateCandidate {
 	bool hasTemplate = false;
 	std::string templateString;
+	// An IRI template's placeholder values are percent-encoded (R2RML 7.3, and
+	// TermMapSql's projection does exactly that for rr:termType rr:IRI), which
+	// is what lets a literal *inside* the template separate two candidates.
+	// annotate() gives a template column the Iri kind only for rr:IRI maps
+	// without a datatype or language, so Iri implies encoded; anything else is
+	// treated as unencoded, which only proves less.
+	bool percentEncoded = false;
 };
 
 TemplateCandidate templateCandidateFor(const RelNode &node, const std::string &var) {
@@ -1188,6 +1195,7 @@ TemplateCandidate templateCandidateFor(const RelNode &node, const std::string &v
 	if (col != nullptr && col->prov == Provenance::TemplateExpr) {
 		out.hasTemplate = true;
 		out.templateString = col->templateString;
+		out.percentEncoded = col->term.kind == RdfTermKind::Iri;
 	}
 	return out;
 }
@@ -1196,22 +1204,93 @@ bool candidatesCompatible(const TemplateCandidate &a, const TemplateCandidate &b
 	if (!a.hasTemplate || !b.hasTemplate) {
 		return true; // nothing to disprove without a template on both sides.
 	}
-	return templatesCanEverMatch(a.templateString, b.templateString);
+	return templatesCanEverMatch(a.templateString, b.templateString, a.percentEncoded, b.percentEncoded);
 }
 
-// One TemplateCandidate per directly-visible alternative for `var` on `side`:
-// one per arm if `side` is a UnionByNameNode (each arm is guaranteed a
-// single-candidate SpjRelation, per translateAtomicPattern), or a single
-// entry otherwise.
+bool allHaveTemplates(const std::vector<TemplateCandidate> &candidates) {
+	for (const auto &c : candidates) {
+		if (!c.hasTemplate) {
+			return false;
+		}
+	}
+	return !candidates.empty();
+}
+
+// Every template `var` can be produced by on `side`: a candidate per scan
+// that can supply its value, or a template-less candidate (compatible with
+// everything) wherever that is not provable. A UnionByName contributes its
+// arms' candidates (each arm is a single-candidate SpjRelation, per
+// translateAtomicPattern, or itself composite). A join is looked through:
+//  - an inner join on `var` with a non-null-safe key has `var` equal on both
+//    sides in every output row, so either side's candidates bound it - take
+//    the one that proves something (all templated), the smaller if both do;
+//  - otherwise (a null-safe key, whose COALESCE may take either side's value;
+//    an outer join; no key at all) the value comes from one side or the
+//    other, so the union of both sides' candidates.
+// Filter and Bind pass `var` through from their child unless they compute it
+// (then the child has no such column and the candidate is template-less);
+// MINUS keeps its left side's rows.
 std::vector<TemplateCandidate> gatherCandidates(const RelNode &side, const std::string &var) {
-	if (side.kind() == RelKind::UnionByName) {
+	switch (side.kind()) {
+	case RelKind::UnionByName: {
 		const UnionByNameNode &u = static_cast<const UnionByNameNode &>(side);
 		std::vector<TemplateCandidate> out;
 		out.reserve(u.arms.size());
 		for (const auto &arm : u.arms) {
-			out.push_back(templateCandidateFor(*arm, var));
+			std::vector<TemplateCandidate> armCandidates = gatherCandidates(*arm, var);
+			out.insert(out.end(), armCandidates.begin(), armCandidates.end());
 		}
 		return out;
+	}
+	case RelKind::Join: {
+		const JoinNode &j = static_cast<const JoinNode &>(side);
+		const bool onLeft = j.left->column(var) != nullptr;
+		const bool onRight = j.right->column(var) != nullptr;
+		if (onLeft != onRight) {
+			return gatherCandidates(onLeft ? *j.left : *j.right, var);
+		}
+		if (!onLeft) {
+			break; // computed above the join, or absent: nothing provable.
+		}
+		bool strictKey = false;
+		for (const auto &k : j.keys) {
+			if (k.var == var) {
+				strictKey = !k.nullSafe;
+				break;
+			}
+		}
+		std::vector<TemplateCandidate> left = gatherCandidates(*j.left, var);
+		std::vector<TemplateCandidate> right = gatherCandidates(*j.right, var);
+		if (strictKey && j.joinKind == JoinKind::Inner) {
+			const bool leftProves = allHaveTemplates(left);
+			const bool rightProves = allHaveTemplates(right);
+			if (leftProves && (!rightProves || left.size() <= right.size())) {
+				return left;
+			}
+			if (rightProves) {
+				return right;
+			}
+			return left;
+		}
+		left.insert(left.end(), right.begin(), right.end());
+		return left;
+	}
+	case RelKind::Filter:
+		if (side.column(var) != nullptr) {
+			return gatherCandidates(*static_cast<const FilterNode &>(side).child, var);
+		}
+		break;
+	case RelKind::Bind: {
+		const BindNode &b = static_cast<const BindNode &>(side);
+		if (b.child->column(var) != nullptr) {
+			return gatherCandidates(*b.child, var);
+		}
+		break;
+	}
+	case RelKind::AntiJoin:
+		return gatherCandidates(*static_cast<const AntiJoinNode &>(side).left, var);
+	default:
+		break;
 	}
 	std::vector<TemplateCandidate> out;
 	out.push_back(templateCandidateFor(side, var));
@@ -1417,7 +1496,8 @@ bool armsProvablyDisjoint(const RelNode &a, const RelNode &b) {
 		if (bc == nullptr || bc->prov != Provenance::TemplateExpr) {
 			continue;
 		}
-		if (!templatesCanEverMatch(c.templateString, bc->templateString)) {
+		if (!templatesCanEverMatch(c.templateString, bc->templateString, c.term.kind == RdfTermKind::Iri,
+		                           bc->term.kind == RdfTermKind::Iri)) {
 			return true;
 		}
 	}
