@@ -136,3 +136,41 @@ TEST_CASE("translateQuery: joining an ambiguous object against a subject prunes 
 	CHECK(sql.find("\"TABLE_A\"") != std::string::npos);
 	CHECK(sql.find("\"TABLE_C\"") != std::string::npos);
 }
+
+namespace {
+
+std::size_t countOccurrences(const std::string &text, const std::string &needle) {
+	std::size_t count = 0;
+	for (std::size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + needle.size())) {
+		++count;
+	}
+	return count;
+}
+
+} // namespace
+
+TEST_CASE("translateQuery: a star over one class skips a class whose IRI template differs only in a middle literal") {
+	// sparql2sql_standings.ttl: DriverStanding and ConstructorStanding share
+	// ex:season, ex:points and ex:positionText, and their subject templates
+	// differ only after the first placeholder ("/driver-standing/" vs
+	// "/constructor-standing/"). Percent-encoded placeholder values never
+	// contain '/', so no constructor standing can ever be ?st - and the shared
+	// predicates' constructor arms are dead even though each pattern is joined
+	// to a chain of earlier patterns rather than to one scan.
+	std::string sql = translateFixture("standings_driver_star.rq", "sparql2sql_standings.ttl");
+	INFO(sql);
+	CHECK(sql.find("CONSTRUCTOR_STANDINGS") == std::string::npos);
+	// Every pattern reads the same table under the same subject template, so
+	// the star is one scan of it.
+	CHECK(countOccurrences(sql, "\"DRIVER_STANDINGS\"") == 1);
+	CHECK(sql.find("UNION") == std::string::npos);
+}
+
+TEST_CASE("translateQuery: a shared predicate without a class constraint keeps both classes' tables") {
+	// The same two tables, but nothing in the query rules either out: both
+	// must stay.
+	std::string sql = translateFixture("standings_points_all.rq", "sparql2sql_standings.ttl");
+	INFO(sql);
+	CHECK(sql.find("\"DRIVER_STANDINGS\"") != std::string::npos);
+	CHECK(sql.find("\"CONSTRUCTOR_STANDINGS\"") != std::string::npos);
+}

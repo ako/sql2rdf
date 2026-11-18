@@ -106,6 +106,18 @@ std::string percentDecode(const std::string &value);
 /// rather than introducing a new correctness posture.
 bool templatesCanEverMatch(const std::string &templateA, const std::string &templateB);
 
+/// The same question, for templates whose placeholder values are known to be
+/// percent-encoded or not: `aPercentEncoded`/`bPercentEncoded` are true for an
+/// IRI template (rr:termType rr:IRI), whose substituted values R2RML 7.3 makes
+/// IRI-safe. An encoded value never contains a reserved character such as '/',
+/// '#' or '?', so it cannot run across the literal that follows it, and two
+/// templates that differ in an interior literal - "A/{x}/B/{y}" vs
+/// "A/{x}/C/{y}" - are provably disjoint when both are encoded. An unencoded
+/// value can be any string, so for those the answer is no stronger than the
+/// two-argument form's.
+bool templatesCanEverMatch(const std::string &templateA, const std::string &templateB, bool aPercentEncoded,
+                           bool bPercentEncoded);
+
 /// Whether two rr:template strings have the same literal/placeholder
 /// "shape": the same number of segments, in the same order, with every
 /// literal segment byte-identical and every placeholder position aligned -

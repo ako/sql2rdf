@@ -1,0 +1,58 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#>.
+@prefix ex: <http://example.com/ns#>.
+
+# Two classes over two tables whose IRI subject templates differ only in a
+# literal segment in the MIDDLE ("/driver-standing/" vs "/constructor-standing/"),
+# with the same literal prefix and both ending in a placeholder, and which share
+# three predicates (ex:season, ex:points, ex:positionText). The values of an IRI
+# template's placeholders are percent-encoded (R2RML 7.3), so they never contain
+# '/', which makes the two templates provably disjoint - but only by looking past
+# the first placeholder. A star query over one class must therefore touch only
+# its own table. Modelled on F1DB's seasons_driver_standings and
+# seasons_constructor_standings.
+
+<#DriverStandingMap>
+    rr:logicalTable [ rr:tableName "DRIVER_STANDINGS" ];
+    rr:subjectMap [
+        rr:template "http://ex.org/season/{YEAR}/driver-standing/{POS}";
+        rr:class ex:DriverStanding
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:driver;
+        rr:objectMap [ rr:template "http://ex.org/driver/{DRIVER}" ];
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:season;
+        rr:objectMap [ rr:template "http://ex.org/season/{YEAR}" ];
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:points;
+        rr:objectMap [ rr:column "POINTS" ];
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:positionText;
+        rr:objectMap [ rr:column "POSTEXT" ];
+    ].
+
+<#ConstructorStandingMap>
+    rr:logicalTable [ rr:tableName "CONSTRUCTOR_STANDINGS" ];
+    rr:subjectMap [
+        rr:template "http://ex.org/season/{YEAR}/constructor-standing/{POS}";
+        rr:class ex:ConstructorStanding
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:constructor;
+        rr:objectMap [ rr:template "http://ex.org/constructor/{TEAM}" ];
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:season;
+        rr:objectMap [ rr:template "http://ex.org/season/{YEAR}" ];
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:points;
+        rr:objectMap [ rr:column "POINTS" ];
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:positionText;
+        rr:objectMap [ rr:column "POSTEXT" ];
+    ].

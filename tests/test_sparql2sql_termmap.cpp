@@ -376,3 +376,42 @@ TEST_CASE("invertTermMapAgainstBoundTerm: a VARCHAR-typed column drops the CAST 
 	REQUIRE(noCatalog.whereConditions.size() == 1);
 	CHECK(noCatalog.whereConditions[0] == "CAST(t1.\"ENAME\" AS VARCHAR) = 'SMITH'");
 }
+
+TEST_CASE("templatesCanEverMatch: percent-encoded values prove a middle literal disjoint") {
+	using sparql2sql::templatesCanEverMatch;
+	const std::string driver = "http://ex.org/season/{YEAR}/driver-standing/{POS}";
+	const std::string constructor = "http://ex.org/season/{YEAR}/constructor-standing/{POS}";
+	// Same prefix, both end in a placeholder: the prefix/suffix test alone
+	// cannot tell them apart.
+	CHECK(templatesCanEverMatch(driver, constructor));
+	// IRI templates percent-encode their values, so {YEAR} never contains '/':
+	// it ends at the first '/', and the next literals differ.
+	CHECK_FALSE(templatesCanEverMatch(driver, constructor, true, true));
+	CHECK(templatesCanEverMatch(driver, driver, true, true));
+	CHECK(templatesCanEverMatch(driver, "http://ex.org/season/{Y}/driver-standing/{P}", true, true));
+}
+
+TEST_CASE("templatesCanEverMatch: an unencoded placeholder may contain the literal that would separate it") {
+	using sparql2sql::templatesCanEverMatch;
+	// Literal templates (and blank nodes) are not encoded: {A} = "x/c/z" and
+	// {B} = "b" on the left equals {A} = "x", {B} = "z/d/b" on the right.
+	CHECK(templatesCanEverMatch("s/{A}/d/{B}", "s/{A}/c/{B}", false, false));
+	// Encoded only on one side: the unencoded side can still reach any string.
+	CHECK(templatesCanEverMatch("s/{A}/d/{B}", "s/{A}/c/{B}", true, false));
+}
+
+TEST_CASE("templatesCanEverMatch: encoded values can contain unreserved characters and percent escapes") {
+	using sparql2sql::templatesCanEverMatch;
+	// 'x' and 'y' are unreserved, so they may occur inside an encoded value:
+	// {A} = "qy1" left vs {A} = "q", literal "y", {B} = "1"... both can read "s/qx1y1".
+	CHECK(templatesCanEverMatch("s/{A}x{B}", "s/{A}y{B}", true, true));
+	// Adjacent placeholders: no separating literal, nothing provable.
+	CHECK(templatesCanEverMatch("s/{A}{B}/d", "s/{C}/d", true, true));
+	// '%' appears in encoded values ("%2F" is an encoded '/').
+	CHECK(templatesCanEverMatch("s/{A}", "s/%2F{B}", true, true));
+	// But a reserved character in a literal still has to line up with one.
+	CHECK_FALSE(templatesCanEverMatch("s/{A}?q={B}", "s/{A}#{B}", true, true));
+	// Fully literal templates compare as strings.
+	CHECK_FALSE(templatesCanEverMatch("s/a", "s/b", true, true));
+	CHECK(templatesCanEverMatch("s/a", "s/a", true, true));
+}

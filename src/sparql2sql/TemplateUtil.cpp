@@ -253,6 +253,11 @@ bool templatesCanEverMatch(const std::string &templateA, const std::string &temp
 	return true;
 }
 
+bool templatesCanEverMatch(const std::string &templateA, const std::string &templateB, bool /*aPercentEncoded*/,
+                           bool /*bPercentEncoded*/) {
+	return templatesCanEverMatch(templateA, templateB);
+}
+
 bool sameTemplateShape(const std::string &templateA, const std::string &templateB) {
 	if (templateA == templateB) {
 		return true;

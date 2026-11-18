@@ -1,0 +1,6 @@
+PREFIX ex: <http://example.com/ns#>
+SELECT ?s ?p ?pos WHERE {
+  ?st a ex:DriverStanding ;
+      ex:driver <http://ex.org/driver/max> ;
+      ex:season ?s ; ex:points ?p ; ex:positionText ?pos .
+} ORDER BY ?s
