@@ -405,6 +405,9 @@ public:
 
 class BaseTableOrView : public LogicalTable {
     std::string tableName;
+    std::vector<std::string> nameParts() const; // "hr.EMP" -> {hr, EMP}
+    std::string sqlName() const;                // "hr.EMP" -> "hr"."EMP"
+    static std::vector<std::string> splitQualifiedName(const std::string& name);
 };
 
 class R2RMLView : public LogicalTable {
@@ -412,6 +415,13 @@ class R2RMLView : public LogicalTable {
     std::vector<std::string> sqlVersions;
 };
 ```
+
+`rr:tableName` is a schema-qualified name in SQL identifier syntax (R2RML 5.1): `EMP`, `hr.EMP`,
+`db.hr.EMP`, or with delimited parts such as `"sales"."Dept.Info"`. `nameParts()` splits it at each
+`.` outside a delimited identifier and unquotes the delimited parts. Forward generation and the
+SPARQL-to-SQL translator then quote each part on its own (`"hr"."EMP"`), so a mapping can name a
+table outside the default schema. A name that does not parse, such as `a..b` or one with an
+unterminated quote, is kept whole as a single identifier.
 
 ### Term Map Classes
 
@@ -850,7 +860,9 @@ attempted only when both children render their own SELECT list (a direct SPJ blo
 
 The catalog is keyed by **logical-table identity** — a base table's declared `rr:tableName`, or
 `"view:" + <the rr:sqlQuery text>` for an R2RML view — which is what
-`sparql2sql::logicalTableIdentity()` returns for the source. A view's columns appear in no
+`sparql2sql::logicalTableIdentity()` returns for the source. `sql2rdf::loadTypeCatalog()` files each table under its bare
+name and under its schema- and catalog-qualified names (`EMP`, `hr.EMP`, `db.hr.EMP`), so a
+mapping that writes `rr:tableName "hr.EMP"` finds its types and keys. A view's columns appear in no
 `information_schema`, so a populator that only sweeps one leaves them untyped; see
 `LogicalTableSource.h` below for how to type them, and note that whether a *join key* is eligible
 also depends on the two sides being pure columns or the same invertible template, which a view's

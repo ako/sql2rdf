@@ -95,11 +95,29 @@ bool isNoNullable(std::string_view raw) {
 	return trimmed == "no";
 }
 
+// The names a mapping may give one table in rr:tableName: bare (`EMP`), and
+// qualified by schema (`hr.EMP`) and by catalog too (`db.hr.EMP`). The catalog
+// is keyed by the name as the mapping writes it, so the table's facts are filed
+// under each. A backend that reports no schema or catalog gets the bare name only.
+std::vector<std::string> tableNames(const r2rml::SQLRow &row, const std::string &table) {
+	std::vector<std::string> names {table};
+	auto schema = readColumn(row, "table_schema");
+	if (schema && !schema->empty()) {
+		names.push_back(*schema + "." + table);
+		auto database = readColumn(row, "table_catalog");
+		if (database && !database->empty()) {
+			names.push_back(*database + "." + *schema + "." + table);
+		}
+	}
+	return names;
+}
+
 void loadBaseTableTypes(r2rml::SQLConnection &conn, sparql2sql::TypeCatalog &catalog) {
 	// is_nullable rides along on the sweep we already run - the NOT NULL facts
 	// cost no extra round trip and no rows read.
 	std::unique_ptr<r2rml::SQLResultSet> rs =
-	    conn.execute("SELECT table_name, column_name, data_type, is_nullable FROM information_schema.columns");
+	    conn.execute("SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable FROM "
+	                 "information_schema.columns");
 	while (rs->next()) {
 		const r2rml::SQLRow &row = rs->getCurrentRow();
 		auto table = readColumn(row, "table_name");
@@ -107,9 +125,12 @@ void loadBaseTableTypes(r2rml::SQLConnection &conn, sparql2sql::TypeCatalog &cat
 		if (!table || !colType) {
 			continue;
 		}
-		catalog.columnTypes[*table][colType->first] = colType->second;
-		if (auto nullable = readColumn(row, "is_nullable"); nullable && isNoNullable(*nullable)) {
-			catalog.notNullColumns[*table].insert(colType->first);
+		auto nullable = readColumn(row, "is_nullable");
+		for (const auto &name : tableNames(row, *table)) {
+			catalog.columnTypes[name][colType->first] = colType->second;
+			if (nullable && isNoNullable(*nullable)) {
+				catalog.notNullColumns[name].insert(colType->first);
+			}
 		}
 	}
 }
@@ -121,9 +142,11 @@ void loadBaseTableTypes(r2rml::SQLConnection &conn, sparql2sql::TypeCatalog &cat
 // leaves every key-dependent rewrite declining.
 void loadUniqueKeys(r2rml::SQLConnection &conn, sparql2sql::TypeCatalog &catalog) {
 	std::unique_ptr<r2rml::SQLResultSet> rs = conn.execute(
-	    "SELECT tc.table_name AS table_name, kcu.constraint_name AS constraint_name, kcu.column_name AS column_name "
+	    "SELECT tc.table_catalog AS table_catalog, tc.table_schema AS table_schema, tc.table_name AS table_name, "
+	    "kcu.constraint_name AS constraint_name, kcu.column_name AS column_name "
 	    "FROM information_schema.table_constraints AS tc "
-	    "JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name "
+	    "JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name AND "
+	    "tc.table_schema = kcu.table_schema AND tc.table_name = kcu.table_name "
 	    "WHERE tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')");
 
 	// (table, constraint) -> its column set. Grouped here rather than trusting
@@ -138,7 +161,9 @@ void loadUniqueKeys(r2rml::SQLConnection &conn, sparql2sql::TypeCatalog &catalog
 		if (!table || !constraint || !column) {
 			continue;
 		}
-		keys[std::make_pair(*table, *constraint)].insert(*column);
+		for (const auto &name : tableNames(row, *table)) {
+			keys[std::make_pair(name, *constraint)].insert(*column);
+		}
 	}
 	for (const auto &[tableConstraint, cols] : keys) {
 		catalog.uniqueKeys[tableConstraint.first].push_back(cols);

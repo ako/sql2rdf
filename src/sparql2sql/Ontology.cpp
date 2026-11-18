@@ -147,10 +147,10 @@ const r2rml::TermMap *subjectValue(const r2rml::TriplesMap &tm) {
 	return tm.subjectMap ? tm.subjectMap->valueTermMap() : nullptr;
 }
 
-// The logical table as a FROM item: a quoted table name or a parenthesised query.
+// The logical table as a FROM item: a quoted (schema-qualified) table name or a parenthesised query.
 std::string sourceSql(const r2rml::LogicalTable &table) {
 	if (const auto *base = dynamic_cast<const r2rml::BaseTableOrView *>(&table)) {
-		return quoteIdent(base->tableName);
+		return base->sqlName();
 	}
 	if (const auto *view = dynamic_cast<const r2rml::R2RMLView *>(&table)) {
 		return "(" + stripTrailingSemicolon(view->sqlQuery) + ")";

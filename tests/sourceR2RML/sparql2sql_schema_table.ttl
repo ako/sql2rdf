@@ -1,0 +1,29 @@
+@prefix rr: <http://www.w3.org/ns/r2rml#>.
+@prefix ex: <http://example.com/ns#>.
+
+# rr:tableName is a schema-qualified name in SQL identifier syntax (R2RML 5.1).
+# One table in a schema, written plainly; one whose schema and name are
+# delimited identifiers, the name holding a '.' that is part of the name rather
+# than a separator.
+
+<#EmpMap>
+    rr:logicalTable [ rr:tableName "hr.EMP" ];
+    rr:subjectMap [
+        rr:template "http://ex.org/emp/{ID}";
+        rr:class ex:Employee
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:name;
+        rr:objectMap [ rr:column "NAME" ];
+    ].
+
+<#DeptMap>
+    rr:logicalTable [ rr:tableName "\"sales\".\"Dept.Info\"" ];
+    rr:subjectMap [
+        rr:template "http://ex.org/dept/{ID}";
+        rr:class ex:Department
+    ];
+    rr:predicateObjectMap [
+        rr:predicate ex:name;
+        rr:objectMap [ rr:column "NAME" ];
+    ].
