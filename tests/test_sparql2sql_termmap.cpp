@@ -396,8 +396,12 @@ TEST_CASE("templatesCanEverMatch: an unencoded placeholder may contain the liter
 	// Literal templates (and blank nodes) are not encoded: {A} = "x/c/z" and
 	// {B} = "b" on the left equals {A} = "x", {B} = "z/d/b" on the right.
 	CHECK(templatesCanEverMatch("s/{A}/d/{B}", "s/{A}/c/{B}", false, false));
-	// Encoded only on one side: the unencoded side can still reach any string.
-	CHECK(templatesCanEverMatch("s/{A}/d/{B}", "s/{A}/c/{B}", true, false));
+	// Encoded on one side only: the unencoded value can contain the '/' the
+	// encoded side's literal needs ({B} = "x/c")...
+	CHECK(templatesCanEverMatch("s/{A}/c", "s/{B}", true, false));
+	// ...but not conjure a literal the encoded side never produces: every
+	// string of the left template has "/d/" as its only slash-letter-slash run.
+	CHECK_FALSE(templatesCanEverMatch("s/{A}/d/{B}", "s/{A}/c/{B}", true, false));
 }
 
 TEST_CASE("templatesCanEverMatch: encoded values can contain unreserved characters and percent escapes") {
